@@ -49,15 +49,15 @@ func DefaultSchemaTemplates(cf *client.Factory,
 	discovery discovery.DiscoveryInterface,
 	namespaceCache corecontrollers.NamespaceCache) []schema.Template {
 	return []schema.Template{
-		common.DefaultTemplate(cf, summaryCache, lookup, namespaceCache, false),
+		common.DefaultTemplate(cf, summaryCache, lookup, namespaceCache),
 		apigroups.Template(discovery),
 		{
 			ID:        "configmap",
-			Formatter: formatters.DropHelmData,
+			Formatter: formatters.HandleHelmData,
 		},
 		{
 			ID:        "secret",
-			Formatter: formatters.DropHelmData,
+			Formatter: formatters.HandleHelmData,
 		},
 		{
 			ID:        "pod",
@@ -79,15 +79,15 @@ func DefaultSchemaTemplatesForStore(store types.Store,
 	discovery discovery.DiscoveryInterface) []schema.Template {
 
 	return []schema.Template{
-		common.DefaultTemplateForStore(store, summaryCache, true),
+		common.DefaultTemplateForStore(store, summaryCache),
 		apigroups.Template(discovery),
 		{
 			ID:        "configmap",
-			Formatter: formatters.DropHelmData,
+			Formatter: formatters.HandleHelmData,
 		},
 		{
 			ID:        "secret",
-			Formatter: formatters.DropHelmData,
+			Formatter: formatters.HandleHelmData,
 		},
 		{
 			ID:        "pod",
