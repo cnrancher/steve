@@ -1,8 +1,8 @@
 module github.com/rancher/steve
 
-go 1.22.0
+go 1.23
 
-toolchain go1.22.7
+toolchain go1.23.4
 
 replace (
 	github.com/crewjam/saml => github.com/rancher/saml v0.2.0
@@ -22,7 +22,7 @@ require (
 	github.com/rancher/apiserver v0.0.0-20241009200134-5a4ecca7b988
 	github.com/rancher/dynamiclistener v0.6.1-rc.2
 	github.com/rancher/kubernetes-provider-detector v0.1.5
-	github.com/rancher/lasso v0.0.0-20240924233157-8f384efc8813
+	github.com/rancher/lasso v0.0.0-20241202185148-04649f379358
 	github.com/rancher/norman v0.0.0-20241001183610-78a520c160ab
 	github.com/rancher/remotedialer v0.3.2
 	github.com/rancher/wrangler/v3 v3.0.1-rc.2
@@ -44,6 +44,8 @@ require (
 	k8s.io/kube-aggregator v0.31.1
 	k8s.io/kube-openapi v0.0.0-20240411171206-dc4e619f62f3
 	k8s.io/kubernetes v1.31.1
+	k8s.io/utils v0.0.0-20240711033017-18e509b52bc8
+	modernc.org/sqlite v1.29.10
 	sigs.k8s.io/controller-runtime v0.19.0
 )
 
@@ -137,12 +139,10 @@ require (
 	k8s.io/component-base v0.31.1 // indirect
 	k8s.io/klog/v2 v2.130.1 // indirect
 	k8s.io/kms v0.31.1 // indirect
-	k8s.io/utils v0.0.0-20240711033017-18e509b52bc8 // indirect
 	modernc.org/gc/v3 v3.0.0-20240107210532-573471604cb6 // indirect
 	modernc.org/libc v1.49.3 // indirect
 	modernc.org/mathutil v1.6.0 // indirect
 	modernc.org/memory v1.8.0 // indirect
-	modernc.org/sqlite v1.29.10 // indirect
 	modernc.org/strutil v1.2.0 // indirect
 	modernc.org/token v1.1.0 // indirect
 	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.30.3 // indirect

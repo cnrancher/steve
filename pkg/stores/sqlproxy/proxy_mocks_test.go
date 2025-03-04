@@ -14,9 +14,9 @@ import (
 	reflect "reflect"
 
 	types "github.com/rancher/apiserver/pkg/types"
-	informer "github.com/rancher/lasso/pkg/cache/sql/informer"
-	factory "github.com/rancher/lasso/pkg/cache/sql/informer/factory"
-	partition "github.com/rancher/lasso/pkg/cache/sql/partition"
+	informer "github.com/rancher/steve/pkg/sqlcache/informer"
+	factory "github.com/rancher/steve/pkg/sqlcache/informer/factory"
+	partition "github.com/rancher/steve/pkg/sqlcache/partition"
 	summary "github.com/rancher/wrangler/v3/pkg/summary"
 	gomock "go.uber.org/mock/gomock"
 	unstructured "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -263,18 +263,18 @@ func (m *MockCacheFactory) EXPECT() *MockCacheFactoryMockRecorder {
 }
 
 // CacheFor mocks base method.
-func (m *MockCacheFactory) CacheFor(arg0 [][]string, arg1 cache.TransformFunc, arg2 dynamic.ResourceInterface, arg3 schema.GroupVersionKind, arg4 bool) (factory.Cache, error) {
+func (m *MockCacheFactory) CacheFor(arg0 [][]string, arg1 cache.TransformFunc, arg2 dynamic.ResourceInterface, arg3 schema.GroupVersionKind, arg4, arg5 bool) (factory.Cache, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "CacheFor", arg0, arg1, arg2, arg3, arg4)
+	ret := m.ctrl.Call(m, "CacheFor", arg0, arg1, arg2, arg3, arg4, arg5)
 	ret0, _ := ret[0].(factory.Cache)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // CacheFor indicates an expected call of CacheFor.
-func (mr *MockCacheFactoryMockRecorder) CacheFor(arg0, arg1, arg2, arg3, arg4 any) *gomock.Call {
+func (mr *MockCacheFactoryMockRecorder) CacheFor(arg0, arg1, arg2, arg3, arg4, arg5 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CacheFor", reflect.TypeOf((*MockCacheFactory)(nil).CacheFor), arg0, arg1, arg2, arg3, arg4)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CacheFor", reflect.TypeOf((*MockCacheFactory)(nil).CacheFor), arg0, arg1, arg2, arg3, arg4, arg5)
 }
 
 // Reset mocks base method.
