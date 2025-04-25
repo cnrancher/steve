@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"crypto/tls"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -12,17 +11,6 @@ import (
 
 	"github.com/rancher/apiserver/pkg/middleware"
 	"github.com/sirupsen/logrus"
-)
-
-var (
-	insecureClient = &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-		},
-	}
 )
 
 const (
@@ -160,7 +148,10 @@ func (u *Handler) IndexFileOnNotFound() http.Handler {
 func (u *Handler) IndexFile() http.Handler {
 	return u.indexMiddleware(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		if path, isURL := u.path(); isURL {
-			_ = serveIndex(rw, path)
+			err := serveIndex(rw, path)
+			if err != nil {
+				logrus.Errorf("failed to download %s: %v", path, err)
+			}
 		} else {
 			http.ServeFile(rw, req, filepath.Join(path, "index.html"))
 		}
@@ -168,7 +159,12 @@ func (u *Handler) IndexFile() http.Handler {
 }
 
 func serveIndex(resp io.Writer, url string) error {
-	r, err := insecureClient.Get(url)
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+		},
+	}
+	r, err := client.Get(url)
 	if err != nil {
 		return err
 	}
