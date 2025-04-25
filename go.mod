@@ -3,7 +3,7 @@ module github.com/rancher/steve
 go 1.20
 
 replace (
-	github.com/crewjam/saml => github.com/rancher/saml v0.2.0
+	github.com/crewjam/saml => github.com/rancher/saml v0.4.14
 	github.com/knative/pkg => github.com/rancher/pkg v0.0.0-20181214184433-b04c0947ad2f
 	github.com/matryer/moq => github.com/rancher/moq v0.0.0-20190404221404-ee5226d43009
 	k8s.io/client-go => github.com/rancher/client-go v1.28.6-rancher1
@@ -28,7 +28,7 @@ require (
 	github.com/stretchr/testify v1.8.4
 	github.com/urfave/cli v1.22.14
 	github.com/urfave/cli/v2 v2.25.7
-	golang.org/x/sync v0.5.0
+	golang.org/x/sync v0.11.0
 	helm.sh/helm/v3 v3.11.0
 	k8s.io/api v0.28.6
 	k8s.io/apiextensions-apiserver v0.28.6
