@@ -1,19 +1,27 @@
 package informer
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/rancher/steve/pkg/sqlcache/db/transaction"
+	"github.com/rancher/steve/pkg/sqlcache/sqltypes"
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/rancher/steve/pkg/sqlcache/db"
@@ -27,15 +35,36 @@ type ListOptionIndexer struct {
 	namespaced    bool
 	indexedFields []string
 
-	addFieldQuery     string
-	deleteFieldQuery  string
-	upsertLabelsQuery string
-	deleteLabelsQuery string
+	// maximumEventsCount is how many events to keep. 0 means keep all events.
+	maximumEventsCount int
 
-	addFieldStmt     *sql.Stmt
-	deleteFieldStmt  *sql.Stmt
-	upsertLabelsStmt *sql.Stmt
-	deleteLabelsStmt *sql.Stmt
+	latestRVLock sync.RWMutex
+	latestRV     string
+
+	watchersLock sync.RWMutex
+	watchers     map[*watchKey]*watcher
+
+	upsertEventsQuery        string
+	findEventsRowByRVQuery   string
+	listEventsAfterQuery     string
+	deleteEventsByCountQuery string
+	addFieldsQuery           string
+	deleteFieldsByKeyQuery   string
+	deleteFieldsQuery        string
+	upsertLabelsQuery        string
+	deleteLabelsByKeyQuery   string
+	deleteLabelsQuery        string
+
+	upsertEventsStmt        *sql.Stmt
+	findEventsRowByRVStmt   *sql.Stmt
+	listEventsAfterStmt     *sql.Stmt
+	deleteEventsByCountStmt *sql.Stmt
+	addFieldsStmt           *sql.Stmt
+	deleteFieldsByKeyStmt   *sql.Stmt
+	deleteFieldsStmt        *sql.Stmt
+	upsertLabelsStmt        *sql.Stmt
+	deleteLabelsByKeyStmt   *sql.Stmt
+	deleteLabelsStmt        *sql.Stmt
 }
 
 var (
@@ -44,19 +73,43 @@ var (
 	subfieldRegex          = regexp.MustCompile(`([a-zA-Z]+)|(\[[-a-zA-Z./]+])|(\[[0-9]+])`)
 
 	ErrInvalidColumn = errors.New("supplied column is invalid")
+	ErrTooOld        = errors.New("resourceversion too old")
 )
 
 const (
 	matchFmt                 = `%%%s%%`
 	strictMatchFmt           = `%s`
 	escapeBackslashDirective = ` ESCAPE '\'` // The leading space is crucial for unit tests only '
-	createFieldsTableFmt     = `CREATE TABLE "%s_fields" (
+
+	// RV stands for ResourceVersion
+	createEventsTableFmt = `CREATE TABLE "%s_events" (
+                       rv TEXT NOT NULL,
+                       type TEXT NOT NULL,
+                       event BLOB NOT NULL,
+                       PRIMARY KEY (type, rv)
+          )`
+	listEventsAfterFmt = `SELECT type, rv, event
+	       FROM "%s_events"
+	       WHERE rowid > ?
+       `
+	findEventsRowByRVFmt = `SELECT rowid
+               FROM "%s_events"
+               WHERE rv = ?
+       `
+	deleteEventsByCountFmt = `DELETE FROM "%s_events"
+	WHERE rowid
+	NOT IN (
+		SELECT rowid FROM "%s_events" ORDER BY rowid DESC LIMIT ?
+	)`
+
+	createFieldsTableFmt = `CREATE TABLE "%s_fields" (
 			key TEXT NOT NULL PRIMARY KEY,
             %s
 	   )`
 	createFieldsIndexFmt = `CREATE INDEX "%s_%s_index" ON "%s_fields"("%s")`
+	deleteFieldsFmt      = `DELETE FROM "%s_fields"`
 
-	failedToGetFromSliceFmt = "[listoption indexer] failed to get subfield [%s] from slice items: %w"
+	failedToGetFromSliceFmt = "[listoption indexer] failed to get subfield [%s] from slice items"
 
 	createLabelsTableFmt = `CREATE TABLE IF NOT EXISTS "%s_labels" (
 		key TEXT NOT NULL REFERENCES "%s"(key) ON DELETE CASCADE,
@@ -66,14 +119,30 @@ const (
 	)`
 	createLabelsTableIndexFmt = `CREATE INDEX IF NOT EXISTS "%s_labels_index" ON "%s_labels"(label, value)`
 
-	upsertLabelsStmtFmt = `REPLACE INTO "%s_labels"(key, label, value) VALUES (?, ?, ?)`
-	deleteLabelsStmtFmt = `DELETE FROM "%s_labels" WHERE KEY = ?`
+	upsertLabelsStmtFmt      = `REPLACE INTO "%s_labels"(key, label, value) VALUES (?, ?, ?)`
+	deleteLabelsByKeyStmtFmt = `DELETE FROM "%s_labels" WHERE KEY = ?`
+	deleteLabelsStmtFmt      = `DELETE FROM "%s_labels"`
 )
+
+type ListOptionIndexerOptions struct {
+	// Fields is a list of fields within the object that we want indexed for
+	// filtering & sorting. Each field is specified as a slice.
+	//
+	// For example, .metadata.resourceVersion should be specified as []string{"metadata", "resourceVersion"}
+	Fields [][]string
+	// IsNamespaced determines whether the GVK for this ListOptionIndexer is
+	// namespaced
+	IsNamespaced bool
+	// MaximumEventsCount is the maximum number of events we want to keep
+	// in the _events table.
+	//
+	// Zero means never delete events.
+	MaximumEventsCount int
+}
 
 // NewListOptionIndexer returns a SQLite-backed cache.Indexer of unstructured.Unstructured Kubernetes resources of a certain GVK
 // ListOptionIndexer is also able to satisfy ListOption queries on indexed (sub)fields.
-// Fields are specified as slices (e.g. "metadata.resourceVersion" is ["metadata", "resourceVersion"])
-func NewListOptionIndexer(ctx context.Context, fields [][]string, s Store, namespaced bool) (*ListOptionIndexer, error) {
+func NewListOptionIndexer(ctx context.Context, s Store, opts ListOptionIndexerOptions) (*ListOptionIndexer, error) {
 	// necessary in order to gob/ungob unstructured.Unstructured objects
 	gob.Register(map[string]interface{}{})
 	gob.Register([]interface{}{})
@@ -87,22 +156,34 @@ func NewListOptionIndexer(ctx context.Context, fields [][]string, s Store, names
 	for _, f := range defaultIndexedFields {
 		indexedFields = append(indexedFields, f)
 	}
-	if namespaced {
+	if opts.IsNamespaced {
 		indexedFields = append(indexedFields, defaultIndexNamespaced)
 	}
-	for _, f := range fields {
+	for _, f := range opts.Fields {
 		indexedFields = append(indexedFields, toColumnName(f))
 	}
 
 	l := &ListOptionIndexer{
-		Indexer:       i,
-		namespaced:    namespaced,
-		indexedFields: indexedFields,
+		Indexer:            i,
+		namespaced:         opts.IsNamespaced,
+		indexedFields:      indexedFields,
+		maximumEventsCount: opts.MaximumEventsCount,
+		watchers:           make(map[*watchKey]*watcher),
 	}
-	l.RegisterAfterUpsert(l.addIndexFields)
-	l.RegisterAfterUpsert(l.addLabels)
-	l.RegisterAfterDelete(l.deleteIndexFields)
-	l.RegisterAfterDelete(l.deleteLabels)
+	l.RegisterAfterAdd(l.addIndexFields)
+	l.RegisterAfterAdd(l.addLabels)
+	l.RegisterAfterAdd(l.notifyEventAdded)
+	l.RegisterAfterAdd(l.deleteOldEvents)
+	l.RegisterAfterUpdate(l.addIndexFields)
+	l.RegisterAfterUpdate(l.addLabels)
+	l.RegisterAfterUpdate(l.notifyEventModified)
+	l.RegisterAfterUpdate(l.deleteOldEvents)
+	l.RegisterAfterDelete(l.deleteFieldsByKey)
+	l.RegisterAfterDelete(l.deleteLabelsByKey)
+	l.RegisterAfterDelete(l.notifyEventDeleted)
+	l.RegisterAfterDelete(l.deleteOldEvents)
+	l.RegisterAfterDeleteAll(l.deleteFields)
+	l.RegisterAfterDeleteAll(l.deleteLabels)
 	columnDefs := make([]string, len(indexedFields))
 	for index, field := range indexedFields {
 		column := fmt.Sprintf(`"%s" TEXT`, field)
@@ -115,6 +196,12 @@ func NewListOptionIndexer(ctx context.Context, fields [][]string, s Store, names
 	setStatements := make([]string, len(indexedFields))
 
 	err = l.WithTransaction(ctx, true, func(tx transaction.Client) error {
+		createEventsTableQuery := fmt.Sprintf(createEventsTableFmt, dbName)
+		_, err = tx.Exec(createEventsTableQuery)
+		if err != nil {
+			return &db.QueryError{QueryString: createEventsTableFmt, Err: err}
+		}
+
 		_, err = tx.Exec(fmt.Sprintf(createFieldsTableFmt, dbName, strings.Join(columnDefs, ", ")))
 		if err != nil {
 			return err
@@ -156,27 +243,249 @@ func NewListOptionIndexer(ctx context.Context, fields [][]string, s Store, names
 		return nil, err
 	}
 
-	l.addFieldQuery = fmt.Sprintf(
+	l.upsertEventsQuery = fmt.Sprintf(
+		`REPLACE INTO "%s_events"(rv, type, event) VALUES (?, ?, ?)`,
+		dbName,
+	)
+	l.upsertEventsStmt = l.Prepare(l.upsertEventsQuery)
+
+	l.listEventsAfterQuery = fmt.Sprintf(listEventsAfterFmt, dbName)
+	l.listEventsAfterStmt = l.Prepare(l.listEventsAfterQuery)
+
+	l.findEventsRowByRVQuery = fmt.Sprintf(findEventsRowByRVFmt, dbName)
+	l.findEventsRowByRVStmt = l.Prepare(l.findEventsRowByRVQuery)
+
+	l.deleteEventsByCountQuery = fmt.Sprintf(deleteEventsByCountFmt, dbName, dbName)
+	l.deleteEventsByCountStmt = l.Prepare(l.deleteEventsByCountQuery)
+
+	l.addFieldsQuery = fmt.Sprintf(
 		`INSERT INTO "%s_fields"(key, %s) VALUES (?, %s) ON CONFLICT DO UPDATE SET %s`,
 		dbName,
 		strings.Join(columns, ", "),
 		strings.Join(qmarks, ", "),
 		strings.Join(setStatements, ", "),
 	)
-	l.deleteFieldQuery = fmt.Sprintf(`DELETE FROM "%s_fields" WHERE key = ?`, dbName)
+	l.deleteFieldsByKeyQuery = fmt.Sprintf(`DELETE FROM "%s_fields" WHERE key = ?`, dbName)
+	l.deleteFieldsQuery = fmt.Sprintf(deleteFieldsFmt, dbName)
 
-	l.addFieldStmt = l.Prepare(l.addFieldQuery)
-	l.deleteFieldStmt = l.Prepare(l.deleteFieldQuery)
+	l.addFieldsStmt = l.Prepare(l.addFieldsQuery)
+	l.deleteFieldsByKeyStmt = l.Prepare(l.deleteFieldsByKeyQuery)
+	l.deleteFieldsStmt = l.Prepare(l.deleteFieldsQuery)
 
 	l.upsertLabelsQuery = fmt.Sprintf(upsertLabelsStmtFmt, dbName)
+	l.deleteLabelsByKeyQuery = fmt.Sprintf(deleteLabelsByKeyStmtFmt, dbName)
 	l.deleteLabelsQuery = fmt.Sprintf(deleteLabelsStmtFmt, dbName)
 	l.upsertLabelsStmt = l.Prepare(l.upsertLabelsQuery)
+	l.deleteLabelsByKeyStmt = l.Prepare(l.deleteLabelsByKeyQuery)
 	l.deleteLabelsStmt = l.Prepare(l.deleteLabelsQuery)
 
 	return l, nil
 }
 
+func (l *ListOptionIndexer) Watch(ctx context.Context, opts WatchOptions, eventsCh chan<- watch.Event) error {
+	l.latestRVLock.RLock()
+	latestRV := l.latestRV
+	l.latestRVLock.RUnlock()
+
+	targetRV := opts.ResourceVersion
+	if opts.ResourceVersion == "" {
+		targetRV = latestRV
+	}
+
+	var events []watch.Event
+	var key *watchKey
+	// Even though we're not writing in this transaction, we prevent other writes to SQL
+	// because we don't want to add more events while we're backfilling events, so we don't miss events
+	err := l.WithTransaction(ctx, true, func(tx transaction.Client) error {
+		rowIDRow := tx.Stmt(l.findEventsRowByRVStmt).QueryRowContext(ctx, targetRV)
+		if err := rowIDRow.Err(); err != nil {
+			return &db.QueryError{QueryString: l.findEventsRowByRVQuery, Err: err}
+		}
+
+		var rowID int
+		err := rowIDRow.Scan(&rowID)
+		if errors.Is(err, sql.ErrNoRows) {
+			if targetRV != latestRV {
+				return ErrTooOld
+			}
+		} else if err != nil {
+			return fmt.Errorf("failed scan rowid: %w", err)
+		}
+
+		// Backfilling previous events from resourceVersion
+		rows, err := tx.Stmt(l.listEventsAfterStmt).QueryContext(ctx, rowID)
+		if err != nil {
+			return &db.QueryError{QueryString: l.listEventsAfterQuery, Err: err}
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var typ, rv string
+			var buf sql.RawBytes
+			err := rows.Scan(&typ, &rv, &buf)
+			if err != nil {
+				return fmt.Errorf("scanning event row: %w", err)
+			}
+
+			example := &unstructured.Unstructured{}
+			val, err := fromBytes(buf, reflect.TypeOf(example))
+			if err != nil {
+				return fmt.Errorf("decoding event object: %w", err)
+			}
+
+			obj, ok := val.Elem().Interface().(runtime.Object)
+			if !ok {
+				continue
+			}
+
+			filter := opts.Filter
+			if !matchFilter(filter.ID, filter.Namespace, filter.Selector, obj) {
+				continue
+			}
+
+			events = append(events, watch.Event{
+				Type:   watch.EventType(typ),
+				Object: val.Elem().Interface().(runtime.Object),
+			})
+		}
+
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		for _, event := range events {
+			eventsCh <- event
+		}
+
+		key = l.addWatcher(eventsCh, opts.Filter)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	<-ctx.Done()
+	l.removeWatcher(key)
+	return nil
+}
+
+func toBytes(obj any) []byte {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	err := enc.Encode(obj)
+	if err != nil {
+		panic(fmt.Errorf("error while gobbing object: %w", err))
+	}
+	bb := buf.Bytes()
+	return bb
+}
+
+func fromBytes(buf sql.RawBytes, typ reflect.Type) (reflect.Value, error) {
+	dec := gob.NewDecoder(bytes.NewReader(buf))
+	singleResult := reflect.New(typ)
+	err := dec.DecodeValue(singleResult)
+	return singleResult, err
+}
+
+type watchKey struct {
+	_ bool // ensure watchKey is NOT zero-sized to get unique pointers
+}
+
+type watcher struct {
+	ch     chan<- watch.Event
+	filter WatchFilter
+}
+
+func (l *ListOptionIndexer) addWatcher(eventCh chan<- watch.Event, filter WatchFilter) *watchKey {
+	key := new(watchKey)
+	l.watchersLock.Lock()
+	l.watchers[key] = &watcher{
+		ch:     eventCh,
+		filter: filter,
+	}
+	l.watchersLock.Unlock()
+	return key
+}
+
+func (l *ListOptionIndexer) removeWatcher(key *watchKey) {
+	l.watchersLock.Lock()
+	delete(l.watchers, key)
+	l.watchersLock.Unlock()
+}
+
 /* Core methods */
+
+func (l *ListOptionIndexer) notifyEventAdded(key string, obj any, tx transaction.Client) error {
+	return l.notifyEvent(watch.Added, nil, obj, tx)
+}
+
+func (l *ListOptionIndexer) notifyEventModified(key string, obj any, tx transaction.Client) error {
+	oldObj, exists, err := l.GetByKey(key)
+	if err != nil {
+		return fmt.Errorf("error getting old object: %w", err)
+	}
+
+	if !exists {
+		return fmt.Errorf("old object %q should be in store but was not", key)
+	}
+
+	return l.notifyEvent(watch.Modified, oldObj, obj, tx)
+}
+
+func (l *ListOptionIndexer) notifyEventDeleted(key string, obj any, tx transaction.Client) error {
+	oldObj, exists, err := l.GetByKey(key)
+	if err != nil {
+		return fmt.Errorf("error getting old object: %w", err)
+	}
+
+	if !exists {
+		return fmt.Errorf("old object %q should be in store but was not", key)
+	}
+	return l.notifyEvent(watch.Deleted, oldObj, obj, tx)
+}
+
+func (l *ListOptionIndexer) notifyEvent(eventType watch.EventType, oldObj any, obj any, tx transaction.Client) error {
+	acc, err := meta.Accessor(obj)
+	if err != nil {
+		return err
+	}
+
+	latestRV := acc.GetResourceVersion()
+	_, err = tx.Stmt(l.upsertEventsStmt).Exec(latestRV, eventType, toBytes(obj))
+	if err != nil {
+		return &db.QueryError{QueryString: l.upsertEventsQuery, Err: err}
+	}
+
+	l.watchersLock.RLock()
+	for _, watcher := range l.watchers {
+		if !matchWatch(watcher.filter.ID, watcher.filter.Namespace, watcher.filter.Selector, oldObj, obj) {
+			continue
+		}
+
+		watcher.ch <- watch.Event{
+			Type:   eventType,
+			Object: obj.(runtime.Object).DeepCopyObject(),
+		}
+	}
+	l.watchersLock.RUnlock()
+
+	l.latestRVLock.Lock()
+	defer l.latestRVLock.Unlock()
+	l.latestRV = latestRV
+	return nil
+}
+
+func (l *ListOptionIndexer) deleteOldEvents(key string, obj any, tx transaction.Client) error {
+	if l.maximumEventsCount == 0 {
+		return nil
+	}
+
+	_, err := tx.Stmt(l.deleteEventsByCountStmt).Exec(l.maximumEventsCount)
+	if err != nil {
+		return &db.QueryError{QueryString: l.deleteEventsByCountQuery, Err: err}
+	}
+	return nil
+}
 
 // addIndexFields saves sortable/filterable fields into tables
 func (l *ListOptionIndexer) addIndexFields(key string, obj any, tx transaction.Client) error {
@@ -200,9 +509,9 @@ func (l *ListOptionIndexer) addIndexFields(key string, obj any, tx transaction.C
 		}
 	}
 
-	_, err := tx.Stmt(l.addFieldStmt).Exec(args...)
+	_, err := tx.Stmt(l.addFieldsStmt).Exec(args...)
 	if err != nil {
-		return &db.QueryError{QueryString: l.addFieldQuery, Err: err}
+		return &db.QueryError{QueryString: l.addFieldsQuery, Err: err}
 	}
 	return nil
 }
@@ -223,18 +532,34 @@ func (l *ListOptionIndexer) addLabels(key string, obj any, tx transaction.Client
 	return nil
 }
 
-func (l *ListOptionIndexer) deleteIndexFields(key string, tx transaction.Client) error {
+func (l *ListOptionIndexer) deleteFieldsByKey(key string, _ any, tx transaction.Client) error {
 	args := []any{key}
 
-	_, err := tx.Stmt(l.deleteFieldStmt).Exec(args...)
+	_, err := tx.Stmt(l.deleteFieldsByKeyStmt).Exec(args...)
 	if err != nil {
-		return &db.QueryError{QueryString: l.deleteFieldQuery, Err: err}
+		return &db.QueryError{QueryString: l.deleteFieldsByKeyQuery, Err: err}
 	}
 	return nil
 }
 
-func (l *ListOptionIndexer) deleteLabels(key string, tx transaction.Client) error {
-	_, err := tx.Stmt(l.deleteLabelsStmt).Exec(key)
+func (l *ListOptionIndexer) deleteFields(tx transaction.Client) error {
+	_, err := tx.Stmt(l.deleteFieldsStmt).Exec()
+	if err != nil {
+		return &db.QueryError{QueryString: l.deleteFieldsQuery, Err: err}
+	}
+	return nil
+}
+
+func (l *ListOptionIndexer) deleteLabelsByKey(key string, _ any, tx transaction.Client) error {
+	_, err := tx.Stmt(l.deleteLabelsByKeyStmt).Exec(key)
+	if err != nil {
+		return &db.QueryError{QueryString: l.deleteLabelsByKeyQuery, Err: err}
+	}
+	return nil
+}
+
+func (l *ListOptionIndexer) deleteLabels(tx transaction.Client) error {
+	_, err := tx.Stmt(l.deleteLabelsStmt).Exec()
 	if err != nil {
 		return &db.QueryError{QueryString: l.deleteLabelsQuery, Err: err}
 	}
@@ -247,7 +572,7 @@ func (l *ListOptionIndexer) deleteLabels(key string, tx transaction.Client) erro
 //   - the total number of resources (returned list might be a subset depending on pagination options in lo)
 //   - a continue token, if there are more pages after the returned one
 //   - an error instead of all of the above if anything went wrong
-func (l *ListOptionIndexer) ListByOptions(ctx context.Context, lo ListOptions, partitions []partition.Partition, namespace string) (*unstructured.UnstructuredList, int, string, error) {
+func (l *ListOptionIndexer) ListByOptions(ctx context.Context, lo *sqltypes.ListOptions, partitions []partition.Partition, namespace string) (*unstructured.UnstructuredList, int, string, error) {
 	queryInfo, err := l.constructQuery(lo, partitions, namespace, db.Sanitize(l.GetName()))
 	if err != nil {
 		return nil, 0, "", err
@@ -266,8 +591,8 @@ type QueryInfo struct {
 	offset      int
 }
 
-func (l *ListOptionIndexer) constructQuery(lo ListOptions, partitions []partition.Partition, namespace string, dbName string) (*QueryInfo, error) {
-	ensureSortLabelsAreSelected(&lo)
+func (l *ListOptionIndexer) constructQuery(lo *sqltypes.ListOptions, partitions []partition.Partition, namespace string, dbName string) (*QueryInfo, error) {
+	ensureSortLabelsAreSelected(lo)
 	queryInfo := &QueryInfo{}
 	queryUsesLabels := hasLabelFilter(lo.Filters)
 	joinTableIndexByLabelName := make(map[string]int)
@@ -388,26 +713,24 @@ func (l *ListOptionIndexer) constructQuery(lo ListOptions, partitions []partitio
 	countParams := params[:]
 
 	// 3- Sorting: ORDER BY clauses (from lo.Sort)
-	if len(lo.Sort.Fields) != len(lo.Sort.Orders) {
-		return nil, fmt.Errorf("sort fields length %d != sort orders length %d", len(lo.Sort.Fields), len(lo.Sort.Orders))
-	}
-	if len(lo.Sort.Fields) > 0 {
+	if len(lo.SortList.SortDirectives) > 0 {
 		orderByClauses := []string{}
-		for i, field := range lo.Sort.Fields {
-			if isLabelsFieldList(field) {
-				clause, sortParam, err := buildSortLabelsClause(field[2], joinTableIndexByLabelName, lo.Sort.Orders[i] == ASC)
+		for _, sortDirective := range lo.SortList.SortDirectives {
+			fields := sortDirective.Fields
+			if isLabelsFieldList(fields) {
+				clause, sortParam, err := buildSortLabelsClause(fields[2], joinTableIndexByLabelName, sortDirective.Order == sqltypes.ASC)
 				if err != nil {
 					return nil, err
 				}
 				orderByClauses = append(orderByClauses, clause)
 				params = append(params, sortParam)
 			} else {
-				columnName := toColumnName(field)
+				columnName := toColumnName(fields)
 				if err := l.validateColumn(columnName); err != nil {
 					return queryInfo, err
 				}
 				direction := "ASC"
-				if lo.Sort.Orders[i] == DESC {
+				if sortDirective.Order == sqltypes.DESC {
 					direction = "DESC"
 				}
 				orderByClauses = append(orderByClauses, fmt.Sprintf(`f."%s" %s`, columnName, direction))
@@ -424,29 +747,18 @@ func (l *ListOptionIndexer) constructQuery(lo ListOptions, partitions []partitio
 		}
 	}
 
-	// 4- Pagination: LIMIT clause (from lo.Pagination and/or lo.ChunkSize/lo.Resume)
+	// 4- Pagination: LIMIT clause (from lo.Pagination)
 
 	limitClause := ""
-	// take the smallest limit between lo.Pagination and lo.ChunkSize
 	limit := lo.Pagination.PageSize
-	if limit == 0 || (lo.ChunkSize > 0 && lo.ChunkSize < limit) {
-		limit = lo.ChunkSize
-	}
 	if limit > 0 {
 		limitClause = "\n  LIMIT ?"
 		params = append(params, limit)
 	}
 
-	// OFFSET clause (from lo.Pagination and/or lo.Resume)
+	// OFFSET clause (from lo.Pagination)
 	offsetClause := ""
 	offset := 0
-	if lo.Resume != "" {
-		offsetInt, err := strconv.Atoi(lo.Resume)
-		if err != nil {
-			return queryInfo, err
-		}
-		offset = offsetInt
-	}
 	if lo.Pagination.Page >= 1 {
 		offset += lo.Pagination.PageSize * (lo.Pagination.Page - 1)
 	}
@@ -526,7 +838,11 @@ func (l *ListOptionIndexer) executeQuery(ctx context.Context, queryInfo *QueryIn
 		continueToken = fmt.Sprintf("%d", offset+limit)
 	}
 
-	return toUnstructuredList(items), total, continueToken, nil
+	l.latestRVLock.RLock()
+	latestRV := l.latestRV
+	l.latestRVLock.RUnlock()
+
+	return toUnstructuredList(items, latestRV), total, continueToken, nil
 }
 
 func (l *ListOptionIndexer) validateColumn(column string) error {
@@ -539,7 +855,7 @@ func (l *ListOptionIndexer) validateColumn(column string) error {
 }
 
 // buildORClause creates an SQLite compatible query that ORs conditions built from passed filters
-func (l *ListOptionIndexer) buildORClauseFromFilters(orFilters OrFilter, dbName string, joinTableIndexByLabelName map[string]int) (string, []any, error) {
+func (l *ListOptionIndexer) buildORClauseFromFilters(orFilters sqltypes.OrFilter, dbName string, joinTableIndexByLabelName map[string]int) (string, []any, error) {
 	var params []any
 	clauses := make([]string, 0, len(orFilters.Filters))
 	var newParams []any
@@ -594,14 +910,15 @@ func buildSortLabelsClause(labelName string, joinTableIndexByLabelName map[strin
 // There are no thread-safety issues in doing this because the ListOptions object is
 // created in Store.ListByPartitions, and that ends up calling ListOptionIndexer.ConstructQuery.
 // No other goroutines access this object.
-func ensureSortLabelsAreSelected(lo *ListOptions) {
-	if len(lo.Sort.Fields) == 0 {
+func ensureSortLabelsAreSelected(lo *sqltypes.ListOptions) {
+	if len(lo.SortList.SortDirectives) == 0 {
 		return
 	}
 	unboundSortLabels := make(map[string]bool)
-	for _, fieldList := range lo.Sort.Fields {
-		if isLabelsFieldList(fieldList) {
-			unboundSortLabels[fieldList[2]] = true
+	for _, sortDirective := range lo.SortList.SortDirectives {
+		fields := sortDirective.Fields
+		if isLabelsFieldList(fields) {
+			unboundSortLabels[fields[2]] = true
 		}
 	}
 	if len(unboundSortLabels) == 0 {
@@ -609,13 +926,13 @@ func ensureSortLabelsAreSelected(lo *ListOptions) {
 	}
 	// If we have sort directives but no filters, add an exists-filter for each label.
 	if lo.Filters == nil || len(lo.Filters) == 0 {
-		lo.Filters = make([]OrFilter, 1)
-		lo.Filters[0].Filters = make([]Filter, len(unboundSortLabels))
+		lo.Filters = make([]sqltypes.OrFilter, 1)
+		lo.Filters[0].Filters = make([]sqltypes.Filter, len(unboundSortLabels))
 		i := 0
 		for labelName := range unboundSortLabels {
-			lo.Filters[0].Filters[i] = Filter{
+			lo.Filters[0].Filters[i] = sqltypes.Filter{
 				Field: []string{"metadata", "labels", labelName},
-				Op:    Exists,
+				Op:    sqltypes.Exists,
 			}
 			i++
 		}
@@ -636,9 +953,9 @@ func ensureSortLabelsAreSelected(lo *ListOptions) {
 		for labelName, needsBinding := range copyUnboundSortLabels {
 			if needsBinding {
 				// `orFilters` is a copy of lo.Filters[i], so reference the original.
-				lo.Filters[i].Filters = append(lo.Filters[i].Filters, Filter{
+				lo.Filters[i].Filters = append(lo.Filters[i].Filters, sqltypes.Filter{
 					Field: []string{"metadata", "labels", labelName},
-					Op:    Exists,
+					Op:    sqltypes.Exists,
 				})
 			}
 		}
@@ -653,7 +970,7 @@ func ensureSortLabelsAreSelected(lo *ListOptions) {
 // KEY in VALUES
 // KEY notin VALUES
 
-func (l *ListOptionIndexer) getFieldFilter(filter Filter) (string, []any, error) {
+func (l *ListOptionIndexer) getFieldFilter(filter sqltypes.Filter) (string, []any, error) {
 	opString := ""
 	escapeString := ""
 	columnName := toColumnName(filter.Field)
@@ -661,7 +978,7 @@ func (l *ListOptionIndexer) getFieldFilter(filter Filter) (string, []any, error)
 		return "", nil, err
 	}
 	switch filter.Op {
-	case Eq:
+	case sqltypes.Eq:
 		if filter.Partial {
 			opString = "LIKE"
 			escapeString = escapeBackslashDirective
@@ -670,7 +987,7 @@ func (l *ListOptionIndexer) getFieldFilter(filter Filter) (string, []any, error)
 		}
 		clause := fmt.Sprintf(`f."%s" %s ?%s`, columnName, opString, escapeString)
 		return clause, []any{formatMatchTarget(filter)}, nil
-	case NotEq:
+	case sqltypes.NotEq:
 		if filter.Partial {
 			opString = "NOT LIKE"
 			escapeString = escapeBackslashDirective
@@ -680,7 +997,7 @@ func (l *ListOptionIndexer) getFieldFilter(filter Filter) (string, []any, error)
 		clause := fmt.Sprintf(`f."%s" %s ?%s`, columnName, opString, escapeString)
 		return clause, []any{formatMatchTarget(filter)}, nil
 
-	case Lt, Gt:
+	case sqltypes.Lt, sqltypes.Gt:
 		sym, target, err := prepareComparisonParameters(filter.Op, filter.Matches[0])
 		if err != nil {
 			return "", nil, err
@@ -688,18 +1005,18 @@ func (l *ListOptionIndexer) getFieldFilter(filter Filter) (string, []any, error)
 		clause := fmt.Sprintf(`f."%s" %s ?`, columnName, sym)
 		return clause, []any{target}, nil
 
-	case Exists, NotExists:
+	case sqltypes.Exists, sqltypes.NotExists:
 		return "", nil, errors.New("NULL and NOT NULL tests aren't supported for non-label queries")
 
-	case In:
+	case sqltypes.In:
 		fallthrough
-	case NotIn:
+	case sqltypes.NotIn:
 		target := "()"
 		if len(filter.Matches) > 0 {
 			target = fmt.Sprintf("(?%s)", strings.Repeat(", ?", len(filter.Matches)-1))
 		}
 		opString = "IN"
-		if filter.Op == NotIn {
+		if filter.Op == sqltypes.NotIn {
 			opString = "NOT IN"
 		}
 		clause := fmt.Sprintf(`f."%s" %s %s`, columnName, opString, target)
@@ -713,13 +1030,13 @@ func (l *ListOptionIndexer) getFieldFilter(filter Filter) (string, []any, error)
 	return "", nil, fmt.Errorf("unrecognized operator: %s", opString)
 }
 
-func (l *ListOptionIndexer) getLabelFilter(index int, filter Filter, dbName string) (string, []any, error) {
+func (l *ListOptionIndexer) getLabelFilter(index int, filter sqltypes.Filter, dbName string) (string, []any, error) {
 	opString := ""
 	escapeString := ""
 	matchFmtToUse := strictMatchFmt
 	labelName := filter.Field[2]
 	switch filter.Op {
-	case Eq:
+	case sqltypes.Eq:
 		if filter.Partial {
 			opString = "LIKE"
 			escapeString = escapeBackslashDirective
@@ -730,7 +1047,7 @@ func (l *ListOptionIndexer) getLabelFilter(index int, filter Filter, dbName stri
 		clause := fmt.Sprintf(`lt%d.label = ? AND lt%d.value %s ?%s`, index, index, opString, escapeString)
 		return clause, []any{labelName, formatMatchTargetWithFormatter(filter.Matches[0], matchFmtToUse)}, nil
 
-	case NotEq:
+	case sqltypes.NotEq:
 		if filter.Partial {
 			opString = "NOT LIKE"
 			escapeString = escapeBackslashDirective
@@ -738,9 +1055,9 @@ func (l *ListOptionIndexer) getLabelFilter(index int, filter Filter, dbName stri
 		} else {
 			opString = "!="
 		}
-		subFilter := Filter{
+		subFilter := sqltypes.Filter{
 			Field: filter.Field,
-			Op:    NotExists,
+			Op:    sqltypes.NotExists,
 		}
 		existenceClause, subParams, err := l.getLabelFilter(index, subFilter, dbName)
 		if err != nil {
@@ -750,7 +1067,7 @@ func (l *ListOptionIndexer) getLabelFilter(index int, filter Filter, dbName stri
 		params := append(subParams, labelName, formatMatchTargetWithFormatter(filter.Matches[0], matchFmtToUse))
 		return clause, params, nil
 
-	case Lt, Gt:
+	case sqltypes.Lt, sqltypes.Gt:
 		sym, target, err := prepareComparisonParameters(filter.Op, filter.Matches[0])
 		if err != nil {
 			return "", nil, err
@@ -758,18 +1075,18 @@ func (l *ListOptionIndexer) getLabelFilter(index int, filter Filter, dbName stri
 		clause := fmt.Sprintf(`lt%d.label = ? AND lt%d.value %s ?`, index, index, sym)
 		return clause, []any{labelName, target}, nil
 
-	case Exists:
+	case sqltypes.Exists:
 		clause := fmt.Sprintf(`lt%d.label = ?`, index)
 		return clause, []any{labelName}, nil
 
-	case NotExists:
+	case sqltypes.NotExists:
 		clause := fmt.Sprintf(`o.key NOT IN (SELECT o1.key FROM "%s" o1
 		JOIN "%s_fields" f1 ON o1.key = f1.key
 		LEFT OUTER JOIN "%s_labels" lt%di1 ON o1.key = lt%di1.key
 		WHERE lt%di1.label = ?)`, dbName, dbName, dbName, index, index, index)
 		return clause, []any{labelName}, nil
 
-	case In:
+	case sqltypes.In:
 		target := "(?"
 		if len(filter.Matches) > 0 {
 			target += strings.Repeat(", ?", len(filter.Matches)-1)
@@ -783,15 +1100,15 @@ func (l *ListOptionIndexer) getLabelFilter(index int, filter Filter, dbName stri
 		}
 		return clause, matches, nil
 
-	case NotIn:
+	case sqltypes.NotIn:
 		target := "(?"
 		if len(filter.Matches) > 0 {
 			target += strings.Repeat(", ?", len(filter.Matches)-1)
 		}
 		target += ")"
-		subFilter := Filter{
+		subFilter := sqltypes.Filter{
 			Field: filter.Field,
-			Op:    NotExists,
+			Op:    sqltypes.NotExists,
 		}
 		existenceClause, subParams, err := l.getLabelFilter(index, subFilter, dbName)
 		if err != nil {
@@ -807,21 +1124,21 @@ func (l *ListOptionIndexer) getLabelFilter(index int, filter Filter, dbName stri
 	return "", nil, fmt.Errorf("unrecognized operator: %s", opString)
 }
 
-func prepareComparisonParameters(op Op, target string) (string, float64, error) {
+func prepareComparisonParameters(op sqltypes.Op, target string) (string, float64, error) {
 	num, err := strconv.ParseFloat(target, 32)
 	if err != nil {
 		return "", 0, err
 	}
 	switch op {
-	case Lt:
+	case sqltypes.Lt:
 		return "<", num, nil
-	case Gt:
+	case sqltypes.Gt:
 		return ">", num, nil
 	}
 	return "", 0, fmt.Errorf("unrecognized operator when expecting '<' or '>': '%s'", op)
 }
 
-func formatMatchTarget(filter Filter) string {
+func formatMatchTarget(filter sqltypes.Filter) string {
 	format := strictMatchFmt
 	if filter.Partial {
 		format = matchFmt
@@ -903,13 +1220,19 @@ func getField(a any, field string) (any, error) {
 				for index, v := range t {
 					itemVal, ok := v.(map[string]interface{})
 					if !ok {
-						return nil, fmt.Errorf(failedToGetFromSliceFmt, subField, err)
+						return nil, fmt.Errorf(failedToGetFromSliceFmt, subField)
 					}
-					itemStr, ok := itemVal[subField].(string)
-					if !ok {
-						return nil, fmt.Errorf(failedToGetFromSliceFmt, subField, err)
+
+					_, found := itemVal[subField]
+					if found {
+						itemStr, ok := itemVal[subField].(string)
+						if !ok {
+							return nil, fmt.Errorf(failedToGetFromSliceFmt, subField)
+						}
+						result[index] = itemStr
+					} else {
+						result[index] = ""
 					}
-					result[index] = itemStr
 				}
 				return result, nil
 			}
@@ -928,11 +1251,11 @@ func extractSubFields(fields string) []string {
 	return subfields
 }
 
-func isLabelFilter(f *Filter) bool {
+func isLabelFilter(f *sqltypes.Filter) bool {
 	return len(f.Field) >= 2 && f.Field[0] == "metadata" && f.Field[1] == "labels"
 }
 
-func hasLabelFilter(filters []OrFilter) bool {
+func hasLabelFilter(filters []sqltypes.OrFilter) bool {
 	for _, outerFilter := range filters {
 		for _, filter := range outerFilter.Filters {
 			if isLabelFilter(&filter) {
@@ -948,15 +1271,48 @@ func isLabelsFieldList(fields []string) bool {
 }
 
 // toUnstructuredList turns a slice of unstructured objects into an unstructured.UnstructuredList
-func toUnstructuredList(items []any) *unstructured.UnstructuredList {
-	objectItems := make([]map[string]any, len(items))
+func toUnstructuredList(items []any, resourceVersion string) *unstructured.UnstructuredList {
+	objectItems := make([]any, len(items))
 	result := &unstructured.UnstructuredList{
 		Items:  make([]unstructured.Unstructured, len(items)),
 		Object: map[string]interface{}{"items": objectItems},
+	}
+	if resourceVersion != "" {
+		result.SetResourceVersion(resourceVersion)
 	}
 	for i, item := range items {
 		result.Items[i] = *item.(*unstructured.Unstructured)
 		objectItems[i] = item.(*unstructured.Unstructured).Object
 	}
 	return result
+}
+
+func matchWatch(filterName string, filterNamespace string, filterSelector labels.Selector, oldObj any, obj any) bool {
+	matchOld := false
+	if oldObj != nil {
+		matchOld = matchFilter(filterName, filterNamespace, filterSelector, oldObj)
+	}
+	return matchOld || matchFilter(filterName, filterNamespace, filterSelector, obj)
+}
+
+func matchFilter(filterName string, filterNamespace string, filterSelector labels.Selector, obj any) bool {
+	if obj == nil {
+		return false
+	}
+	metadata, err := meta.Accessor(obj)
+	if err != nil {
+		return false
+	}
+	if filterName != "" && filterName != metadata.GetName() {
+		return false
+	}
+	if filterNamespace != "" && filterNamespace != metadata.GetNamespace() {
+		return false
+	}
+	if filterSelector != nil {
+		if !filterSelector.Matches(labels.Set(metadata.GetLabels())) {
+			return false
+		}
+	}
+	return true
 }

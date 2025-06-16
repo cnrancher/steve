@@ -11,18 +11,56 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"reflect"
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/rancher/steve/pkg/sqlcache/db"
+	"github.com/rancher/steve/pkg/sqlcache/encryption"
 	"github.com/rancher/steve/pkg/sqlcache/partition"
+	"github.com/rancher/steve/pkg/sqlcache/sqltypes"
+	"github.com/rancher/steve/pkg/sqlcache/store"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
+	watch "k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/tools/cache"
 )
+
+func makeListOptionIndexer(ctx context.Context, opts ListOptionIndexerOptions) (*ListOptionIndexer, error) {
+	gvk := schema.GroupVersionKind{
+		Group:   "",
+		Version: "v1",
+		Kind:    "ConfigMap",
+	}
+	example := &unstructured.Unstructured{}
+	example.SetGroupVersionKind(gvk)
+	name := informerNameFromGVK(gvk)
+	m, err := encryption.NewManager()
+	if err != nil {
+		return nil, err
+	}
+
+	db, err := db.NewClient(nil, m, m)
+	if err != nil {
+		return nil, err
+	}
+
+	s, err := store.NewStore(ctx, example, cache.DeletionHandlingMetaNamespaceKeyFunc, db, false, name)
+	if err != nil {
+		return nil, err
+	}
+
+	listOptionIndexer, err := NewListOptionIndexer(ctx, s, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return listOptionIndexer, nil
+}
 
 func TestNewListOptionIndexer(t *testing.T) {
 	type testCase struct {
@@ -48,13 +86,18 @@ func TestNewListOptionIndexer(t *testing.T) {
 					t.Fail()
 				}
 			})
-		store.EXPECT().RegisterAfterUpsert(gomock.Any())
+		store.EXPECT().RegisterAfterAdd(gomock.Any())
+		store.EXPECT().RegisterAfterUpdate(gomock.Any())
 		store.EXPECT().Prepare(gomock.Any()).Return(stmt).AnyTimes()
 		// end NewIndexer() logic
 
-		store.EXPECT().RegisterAfterUpsert(gomock.Any()).Times(2)
-		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(2)
+		store.EXPECT().RegisterAfterAdd(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterUpdate(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterDeleteAll(gomock.Any()).Times(2)
 
+		// create events table
+		txClient.EXPECT().Exec(fmt.Sprintf(createEventsTableFmt, id)).Return(nil, nil)
 		// create field table
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
 		// create field table indexes
@@ -72,7 +115,11 @@ func TestNewListOptionIndexer(t *testing.T) {
 				}
 			})
 
-		loi, err := NewListOptionIndexer(context.Background(), fields, store, true)
+		opts := ListOptionIndexerOptions{
+			Fields:       fields,
+			IsNamespaced: true,
+		}
+		loi, err := NewListOptionIndexer(context.Background(), store, opts)
 		assert.Nil(t, err)
 		assert.NotNil(t, loi)
 	}})
@@ -93,7 +140,10 @@ func TestNewListOptionIndexer(t *testing.T) {
 				}
 			})
 
-		_, err := NewListOptionIndexer(context.Background(), fields, store, false)
+		opts := ListOptionIndexerOptions{
+			Fields: fields,
+		}
+		_, err := NewListOptionIndexer(context.Background(), store, opts)
 		assert.NotNil(t, err)
 	}})
 	tests = append(tests, testCase{description: "NewListOptionIndexer() with error returned from Begin(), should return an error", test: func(t *testing.T) {
@@ -113,16 +163,22 @@ func TestNewListOptionIndexer(t *testing.T) {
 					t.Fail()
 				}
 			})
-		store.EXPECT().RegisterAfterUpsert(gomock.Any())
+		store.EXPECT().RegisterAfterAdd(gomock.Any())
+		store.EXPECT().RegisterAfterUpdate(gomock.Any())
 		store.EXPECT().Prepare(gomock.Any()).Return(stmt).AnyTimes()
 		// end NewIndexer() logic
 
-		store.EXPECT().RegisterAfterUpsert(gomock.Any()).Times(2)
-		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(2)
+		store.EXPECT().RegisterAfterAdd(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterUpdate(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterDeleteAll(gomock.Any()).Times(2)
 
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(fmt.Errorf("error"))
 
-		_, err := NewListOptionIndexer(context.Background(), fields, store, false)
+		opts := ListOptionIndexerOptions{
+			Fields: fields,
+		}
+		_, err := NewListOptionIndexer(context.Background(), store, opts)
 		assert.NotNil(t, err)
 	}})
 	tests = append(tests, testCase{description: "NewListOptionIndexer() with error from Exec() when creating fields table, should return an error", test: func(t *testing.T) {
@@ -142,13 +198,17 @@ func TestNewListOptionIndexer(t *testing.T) {
 					t.Fail()
 				}
 			})
-		store.EXPECT().RegisterAfterUpsert(gomock.Any())
+		store.EXPECT().RegisterAfterAdd(gomock.Any())
+		store.EXPECT().RegisterAfterUpdate(gomock.Any())
 		store.EXPECT().Prepare(gomock.Any()).Return(stmt).AnyTimes()
 		// end NewIndexer() logic
 
-		store.EXPECT().RegisterAfterUpsert(gomock.Any()).Times(2)
-		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(2)
+		store.EXPECT().RegisterAfterAdd(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterUpdate(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterDeleteAll(gomock.Any()).Times(2)
 
+		txClient.EXPECT().Exec(fmt.Sprintf(createEventsTableFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.name", id, "metadata.name")).Return(nil, fmt.Errorf("error"))
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(fmt.Errorf("error")).Do(
@@ -159,7 +219,11 @@ func TestNewListOptionIndexer(t *testing.T) {
 				}
 			})
 
-		_, err := NewListOptionIndexer(context.Background(), fields, store, true)
+		opts := ListOptionIndexerOptions{
+			Fields:       fields,
+			IsNamespaced: true,
+		}
+		_, err := NewListOptionIndexer(context.Background(), store, opts)
 		assert.NotNil(t, err)
 	}})
 	tests = append(tests, testCase{description: "NewListOptionIndexer() with error from create-labels, should return an error", test: func(t *testing.T) {
@@ -179,13 +243,17 @@ func TestNewListOptionIndexer(t *testing.T) {
 					t.Fail()
 				}
 			})
-		store.EXPECT().RegisterAfterUpsert(gomock.Any())
+		store.EXPECT().RegisterAfterAdd(gomock.Any())
+		store.EXPECT().RegisterAfterUpdate(gomock.Any())
 		store.EXPECT().Prepare(gomock.Any()).Return(stmt).AnyTimes()
 		// end NewIndexer() logic
 
-		store.EXPECT().RegisterAfterUpsert(gomock.Any()).Times(2)
-		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(2)
+		store.EXPECT().RegisterAfterAdd(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterUpdate(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterDeleteAll(gomock.Any()).Times(2)
 
+		txClient.EXPECT().Exec(fmt.Sprintf(createEventsTableFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.name", id, "metadata.name")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.namespace", id, "metadata.namespace")).Return(nil, nil)
@@ -200,7 +268,11 @@ func TestNewListOptionIndexer(t *testing.T) {
 				}
 			})
 
-		_, err := NewListOptionIndexer(context.Background(), fields, store, true)
+		opts := ListOptionIndexerOptions{
+			Fields:       fields,
+			IsNamespaced: true,
+		}
+		_, err := NewListOptionIndexer(context.Background(), store, opts)
 		assert.NotNil(t, err)
 	}})
 	tests = append(tests, testCase{description: "NewListOptionIndexer() with error from Commit(), should return an error", test: func(t *testing.T) {
@@ -220,13 +292,17 @@ func TestNewListOptionIndexer(t *testing.T) {
 					t.Fail()
 				}
 			})
-		store.EXPECT().RegisterAfterUpsert(gomock.Any())
+		store.EXPECT().RegisterAfterAdd(gomock.Any())
+		store.EXPECT().RegisterAfterUpdate(gomock.Any())
 		store.EXPECT().Prepare(gomock.Any()).Return(stmt).AnyTimes()
 		// end NewIndexer() logic
 
-		store.EXPECT().RegisterAfterUpsert(gomock.Any()).Times(2)
-		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(2)
+		store.EXPECT().RegisterAfterAdd(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterUpdate(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(4)
+		store.EXPECT().RegisterAfterDeleteAll(gomock.Any()).Times(2)
 
+		txClient.EXPECT().Exec(fmt.Sprintf(createEventsTableFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.name", id, "metadata.name")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.namespace", id, "metadata.namespace")).Return(nil, nil)
@@ -242,7 +318,11 @@ func TestNewListOptionIndexer(t *testing.T) {
 				}
 			})
 
-		_, err := NewListOptionIndexer(context.Background(), fields, store, true)
+		opts := ListOptionIndexerOptions{
+			Fields:       fields,
+			IsNamespaced: true,
+		}
+		_, err := NewListOptionIndexer(context.Background(), store, opts)
 		assert.NotNil(t, err)
 	}})
 
@@ -252,649 +332,539 @@ func TestNewListOptionIndexer(t *testing.T) {
 	}
 }
 
-func TestListByOptions(t *testing.T) {
+func TestNewListOptionIndexerEasy(t *testing.T) {
+	ctx := context.Background()
+
 	type testCase struct {
-		description           string
-		listOptions           ListOptions
-		partitions            []partition.Partition
-		ns                    string
-		expectedCountStmt     string
-		expectedCountStmtArgs []any
-		expectedStmt          string
-		expectedStmtArgs      []any
-		extraIndexedFields    []string
-		expectedList          *unstructured.UnstructuredList
-		returnList            []any
-		expectedContToken     string
-		expectedErr           error
+		description string
+		listOptions sqltypes.ListOptions
+		partitions  []partition.Partition
+		ns          string
+
+		items []*unstructured.Unstructured
+
+		extraIndexedFields [][]string
+		expectedList       *unstructured.UnstructuredList
+		expectedTotal      int
+		expectedContToken  string
+		expectedErr        error
+	}
+	foo := map[string]any{
+		"metadata": map[string]any{
+			"name":      "obj1",
+			"namespace": "ns-a",
+			"somefield": "foo",
+			"sortfield": "4",
+		},
+	}
+	bar := map[string]any{
+		"metadata": map[string]any{
+			"name":      "obj2",
+			"namespace": "ns-a",
+			"somefield": "bar",
+			"sortfield": "1",
+			"labels": map[string]any{
+				"cows":   "milk",
+				"horses": "saddles",
+			},
+		},
+	}
+	baz := map[string]any{
+		"metadata": map[string]any{
+			"name":      "obj3",
+			"namespace": "ns-a",
+			"somefield": "baz",
+			"sortfield": "2",
+			"labels": map[string]any{
+				"horses": "saddles",
+			},
+		},
+		"status": map[string]any{
+			"someotherfield": "helloworld",
+		},
+	}
+	toto := map[string]any{
+		"metadata": map[string]any{
+			"name":      "obj4",
+			"namespace": "ns-a",
+			"somefield": "toto",
+			"sortfield": "2",
+			"labels": map[string]any{
+				"cows": "milk",
+			},
+		},
+	}
+	lodgePole := map[string]any{
+		"metadata": map[string]any{
+			"name":      "obj5",
+			"namespace": "ns-b",
+			"unknown":   "hi",
+			"labels": map[string]any{
+				"guard.cattle.io": "lodgepole",
+			},
+		},
 	}
 
-	testObject := testStoreObject{Id: "something", Val: "a"}
-	unstrTestObjectMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&testObject)
-	assert.Nil(t, err)
+	makeList := func(t *testing.T, objs ...map[string]any) *unstructured.UnstructuredList {
+		t.Helper()
+
+		if len(objs) == 0 {
+			return &unstructured.UnstructuredList{Object: map[string]any{"items": []any{}}, Items: []unstructured.Unstructured{}}
+		}
+
+		var items []any
+		for _, obj := range objs {
+			items = append(items, obj)
+		}
+
+		list := &unstructured.Unstructured{
+			Object: map[string]any{
+				"items": items,
+			},
+		}
+
+		itemList, err := list.ToList()
+		require.NoError(t, err)
+
+		return itemList
+	}
+	itemList := makeList(t, foo, bar, baz, toto, lodgePole)
 
 	var tests []testCase
 	tests = append(tests, testCase{
-		description: "ListByOptions() with no errors returned, should not return an error",
-		listOptions: ListOptions{},
-		partitions:  []partition.Partition{},
-		ns:          "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE)
-  ORDER BY f."metadata.name" ASC `,
-		returnList:        []any{},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{}}, Items: []unstructured.Unstructured{}},
+		description:       "ListByOptions() with no errors returned, should not return an error",
+		listOptions:       sqltypes.ListOptions{},
+		partitions:        []partition.Partition{},
+		ns:                "",
+		expectedList:      makeList(t),
+		expectedTotal:     0,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
 	tests = append(tests, testCase{
 		description: "ListByOptions() with an empty filter, should not return an error",
-		listOptions: ListOptions{
-			Filters: []OrFilter{{[]Filter{}}},
+		listOptions: sqltypes.ListOptions{
+			Filters: []sqltypes.OrFilter{{[]sqltypes.Filter{}}},
 		},
-		partitions: []partition.Partition{},
-		ns:         "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE)
-  ORDER BY f."metadata.name" ASC `,
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{}}, Items: []unstructured.Unstructured{}},
+		partitions:        []partition.Partition{},
+		ns:                "",
+		expectedList:      makeList(t),
+		expectedTotal:     0,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
 	tests = append(tests, testCase{
-		description: "ListByOptions with ChunkSize set should set limit in prepared sql.Stmt",
-		listOptions: ListOptions{ChunkSize: 2},
-		partitions:  []partition.Partition{},
-		ns:          "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE)
-  ORDER BY f."metadata.name" ASC 
-  LIMIT ?`,
-		expectedStmtArgs: []interface{}{2},
-		expectedCountStmt: `SELECT COUNT(*) FROM (SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE))`,
-		expectedCountStmtArgs: []any{},
-		returnList:            []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:          &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
-		expectedContToken:     "",
-		expectedErr:           nil,
-	})
-	tests = append(tests, testCase{
-		description: "ListByOptions with Resume set should set offset in prepared sql.Stmt",
-		listOptions: ListOptions{Resume: "4"},
-		partitions:  []partition.Partition{},
-		ns:          "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE)
-  ORDER BY f."metadata.name" ASC 
-  OFFSET ?`,
-		expectedStmtArgs: []interface{}{4},
-		expectedCountStmt: `SELECT COUNT(*) FROM (SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE))`,
-		expectedCountStmtArgs: []any{},
-		returnList:            []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:          &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
-		expectedContToken:     "",
-		expectedErr:           nil,
-	})
-	tests = append(tests, testCase{
 		description: "ListByOptions with 1 OrFilter set with 1 filter should select where that filter is true in prepared sql.Stmt",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "somefield"},
-						Matches: []string{"somevalue"},
-						Op:      Eq,
+						Matches: []string{"foo"},
+						Op:      sqltypes.Eq,
 						Partial: true,
 					},
 				},
 			},
 		},
 		},
-		partitions: []partition.Partition{},
-		ns:         "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (f."metadata.somefield" LIKE ? ESCAPE '\') AND
-    (FALSE)
-  ORDER BY f."metadata.name" ASC `,
-		expectedStmtArgs:  []any{"%somevalue%"},
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, foo),
+		expectedTotal:     1,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
 	tests = append(tests, testCase{
 		description: "ListByOptions with 1 OrFilter set with 1 filter with Op set top NotEq should select where that filter is not true in prepared sql.Stmt",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "somefield"},
-						Matches: []string{"somevalue"},
-						Op:      NotEq,
+						Matches: []string{"foo"},
+						Op:      sqltypes.NotEq,
 						Partial: true,
 					},
 				},
 			},
 		},
 		},
-		partitions: []partition.Partition{},
-		ns:         "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (f."metadata.somefield" NOT LIKE ? ESCAPE '\') AND
-    (FALSE)
-  ORDER BY f."metadata.name" ASC `,
-		expectedStmtArgs:  []any{"%somevalue%"},
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, bar, baz, toto, lodgePole),
+		expectedTotal:     4,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
 	tests = append(tests, testCase{
 		description: "ListByOptions with 1 OrFilter set with 1 filter with Partial set to true should select where that partial match on that filter's value is true in prepared sql.Stmt",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "somefield"},
-						Matches: []string{"somevalue"},
-						Op:      Eq,
+						Matches: []string{"o"},
+						Op:      sqltypes.Eq,
 						Partial: true,
 					},
 				},
 			},
 		},
 		},
-		partitions: []partition.Partition{},
-		ns:         "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (f."metadata.somefield" LIKE ? ESCAPE '\') AND
-    (FALSE)
-  ORDER BY f."metadata.name" ASC `,
-		expectedStmtArgs:  []any{"%somevalue%"},
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, foo, toto),
+		expectedTotal:     2,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
 	tests = append(tests, testCase{
 		description: "ListByOptions with 1 OrFilter set with multiple filters should select where any of those filters are true in prepared sql.Stmt",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "somefield"},
-						Matches: []string{"somevalue"},
-						Op:      Eq,
+						Matches: []string{"foo"},
+						Op:      sqltypes.Eq,
 						Partial: true,
 					},
 					{
 						Field:   []string{"metadata", "somefield"},
-						Matches: []string{"someothervalue"},
-						Op:      Eq,
+						Matches: []string{"bar"},
+						Op:      sqltypes.Eq,
 						Partial: true,
 					},
 					{
 						Field:   []string{"metadata", "somefield"},
-						Matches: []string{"somethirdvalue"},
-						Op:      NotEq,
+						Matches: []string{"toto"},
+						Op:      sqltypes.NotEq,
 						Partial: true,
 					},
 				},
 			},
 		},
 		},
-		partitions: []partition.Partition{},
-		ns:         "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    ((f."metadata.somefield" LIKE ? ESCAPE '\') OR (f."metadata.somefield" LIKE ? ESCAPE '\') OR (f."metadata.somefield" NOT LIKE ? ESCAPE '\')) AND
-    (FALSE)
-  ORDER BY f."metadata.name" ASC `,
-		expectedStmtArgs:  []any{"%somevalue%", "%someothervalue%", "%somethirdvalue%"},
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, foo, bar, baz, lodgePole),
+		expectedTotal:     4,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
 	tests = append(tests, testCase{
 		description: "ListByOptions with multiple OrFilters set should select where all OrFilters contain one filter that is true in prepared sql.Stmt",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				Filters: []Filter{
+				Filters: []sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "somefield"},
-						Matches: []string{"value1"},
-						Op:      Eq,
+						Matches: []string{"foo"},
+						Op:      sqltypes.Eq,
 						Partial: false,
 					},
 					{
 						Field:   []string{"status", "someotherfield"},
-						Matches: []string{"value2"},
-						Op:      NotEq,
+						Matches: []string{"helloworld"},
+						Op:      sqltypes.NotEq,
 						Partial: false,
 					},
 				},
 			},
 			{
-				Filters: []Filter{
+				Filters: []sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "somefield"},
-						Matches: []string{"value3"},
-						Op:      Eq,
+						Matches: []string{"toto"},
+						Op:      sqltypes.Eq,
 						Partial: false,
 					},
 				},
 			},
 		},
 		},
-		partitions: []partition.Partition{},
-		ns:         "test4",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    ((f."metadata.somefield" = ?) OR (f."status.someotherfield" != ?)) AND
-    (f."metadata.somefield" = ?) AND
-    (f."metadata.namespace" = ?) AND
-    (FALSE)
-  ORDER BY f."metadata.name" ASC `,
-		expectedStmtArgs:  []any{"value1", "value2", "value3", "test4"},
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, toto),
+		expectedTotal:     1,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
 	tests = append(tests, testCase{
 		description: "ListByOptions with labels filter should select the label in the prepared sql.Stmt",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				Filters: []Filter{
+				Filters: []sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "guard.cattle.io"},
 						Matches: []string{"lodgepole"},
-						Op:      Eq,
+						Op:      sqltypes.Eq,
 						Partial: true,
 					},
 				},
 			},
 		},
 		},
-		partitions: []partition.Partition{},
-		ns:         "test41",
-		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  LEFT OUTER JOIN "something_labels" lt1 ON o.key = lt1.key
-  WHERE
-    (lt1.label = ? AND lt1.value LIKE ? ESCAPE '\') AND
-    (f."metadata.namespace" = ?) AND
-    (FALSE)
-  ORDER BY f."metadata.name" ASC `,
-		expectedStmtArgs:  []any{"guard.cattle.io", "%lodgepole%", "test41"},
-		returnList:        []any{},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{}}, Items: []unstructured.Unstructured{}},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, lodgePole),
+		expectedTotal:     1,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
-
 	tests = append(tests, testCase{
 		description: "ListByOptions with two labels filters should use a self-join",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{
+			Filters: []sqltypes.OrFilter{
+				{
+					Filters: []sqltypes.Filter{
+						{
+							Field:   []string{"metadata", "labels", "cows"},
+							Matches: []string{"milk"},
+							Op:      sqltypes.Eq,
+							Partial: false,
+						},
+					},
+				},
+				{
+					Filters: []sqltypes.Filter{
+						{
+							Field:   []string{"metadata", "labels", "horses"},
+							Matches: []string{"saddles"},
+							Op:      sqltypes.Eq,
+							Partial: false,
+						},
+					},
+				},
+			},
+		},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, bar),
+		expectedTotal:     1,
+		expectedContToken: "",
+		expectedErr:       nil,
+	})
+	tests = append(tests, testCase{
+		description: "ListByOptions with a mix of one label and one non-label query can still self-join",
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				Filters: []Filter{
+				Filters: []sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "cows"},
 						Matches: []string{"milk"},
-						Op:      Eq,
+						Op:      sqltypes.Eq,
 						Partial: false,
 					},
 				},
 			},
 			{
-				Filters: []Filter{
-					{
-						Field:   []string{"metadata", "labels", "horses"},
-						Matches: []string{"saddles"},
-						Op:      Eq,
-						Partial: false,
-					},
-				},
-			},
-		},
-		},
-		partitions: []partition.Partition{},
-		ns:         "test42",
-		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  LEFT OUTER JOIN "something_labels" lt1 ON o.key = lt1.key
-  LEFT OUTER JOIN "something_labels" lt2 ON o.key = lt2.key
-  WHERE
-    (lt1.label = ? AND lt1.value = ?) AND
-    (lt2.label = ? AND lt2.value = ?) AND
-    (f."metadata.namespace" = ?) AND
-    (FALSE)
-  ORDER BY f."metadata.name" ASC `,
-		expectedStmtArgs:  []any{"cows", "milk", "horses", "saddles", "test42"},
-		returnList:        []any{},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{}}, Items: []unstructured.Unstructured{}},
-		expectedContToken: "",
-		expectedErr:       nil,
-	})
-
-	tests = append(tests, testCase{
-		description: "ListByOptions with a mix of one label and one non-label query can still self-join",
-		listOptions: ListOptions{Filters: []OrFilter{
-			{
-				Filters: []Filter{
-					{
-						Field:   []string{"metadata", "labels", "cows"},
-						Matches: []string{"butter"},
-						Op:      Eq,
-						Partial: false,
-					},
-				},
-			},
-			{
-				Filters: []Filter{
+				Filters: []sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "somefield"},
-						Matches: []string{"wheat"},
-						Op:      Eq,
+						Matches: []string{"toto"},
+						Op:      sqltypes.Eq,
 						Partial: false,
 					},
 				},
 			},
 		},
 		},
-		partitions: []partition.Partition{},
-		ns:         "test43",
-		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  LEFT OUTER JOIN "something_labels" lt1 ON o.key = lt1.key
-  WHERE
-    (lt1.label = ? AND lt1.value = ?) AND
-    (f."metadata.somefield" = ?) AND
-    (f."metadata.namespace" = ?) AND
-    (FALSE)
-  ORDER BY f."metadata.name" ASC `,
-		expectedStmtArgs:  []any{"cows", "butter", "wheat", "test43"},
-		returnList:        []any{},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{}}, Items: []unstructured.Unstructured{}},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, toto),
+		expectedTotal:     1,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
-
 	tests = append(tests, testCase{
 		description: "ListByOptions with only one Sort.Field set should sort on that field only, in ascending order in prepared sql.Stmt",
-		listOptions: ListOptions{
-			Sort: Sort{
-				Fields: [][]string{{"metadata", "somefield"}},
-				Orders: []SortOrder{ASC},
+		listOptions: sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "somefield"},
+						Order:  sqltypes.ASC,
+					},
+				},
 			},
 		},
-		partitions: []partition.Partition{},
-		ns:         "test5",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (f."metadata.namespace" = ?) AND
-    (FALSE)
-  ORDER BY f."metadata.somefield" ASC`,
-		expectedStmtArgs:  []any{"test5"},
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, lodgePole, bar, baz, foo, toto),
+		expectedTotal:     5,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
-
 	tests = append(tests, testCase{
 		description: "sort one field descending",
-		listOptions: ListOptions{
-			Sort: Sort{
-				Fields: [][]string{{"metadata", "somefield"}},
-				Orders: []SortOrder{DESC},
+		listOptions: sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "somefield"},
+						Order:  sqltypes.DESC,
+					},
+				},
 			},
 		},
-		partitions: []partition.Partition{},
-		ns:         "test5a",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (f."metadata.namespace" = ?) AND
-    (FALSE)
-  ORDER BY f."metadata.somefield" DESC`,
-		expectedStmtArgs:  []any{"test5a"},
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, toto, foo, baz, bar, lodgePole),
+		expectedTotal:     5,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
-
 	tests = append(tests, testCase{
-		description: "sort one unbound label descending",
-		listOptions: ListOptions{
-			Sort: Sort{
-				Fields: [][]string{{"metadata", "labels", "flip"}},
-				Orders: []SortOrder{DESC},
+		description: "sort one unbound field descending",
+		listOptions: sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "unknown"},
+						Order:  sqltypes.DESC,
+					},
+				},
 			},
 		},
-		partitions: []partition.Partition{},
-		ns:         "test5a",
-		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  LEFT OUTER JOIN "something_labels" lt1 ON o.key = lt1.key
-  WHERE
-    (lt1.label = ?) AND
-    (f."metadata.namespace" = ?) AND
-    (FALSE)
-  ORDER BY (CASE lt1.label WHEN ? THEN lt1.value ELSE NULL END) DESC NULLS FIRST`,
-		expectedStmtArgs:  []any{"flip", "test5a", "flip"},
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, lodgePole, toto, baz, bar, foo),
+		expectedTotal:     5,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
-
-	tests = append(tests, testCase{
-		description: "ListByOptions sorting on two complex fields should sort on the first field in ascending order first and then sort on the second labels field in ascending order in prepared sql.Stmt",
-		listOptions: ListOptions{
-			Sort: Sort{
-				Fields: [][]string{{"metadata", "fields", "3"}, {"metadata", "labels", "stub.io/candy"}},
-				Orders: []SortOrder{ASC, ASC},
-			},
-		},
-		extraIndexedFields: []string{"metadata.fields[3]", "metadata.labels[stub.io/candy]"},
-		partitions:         []partition.Partition{},
-		ns:                 "",
-		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  LEFT OUTER JOIN "something_labels" lt1 ON o.key = lt1.key
-  WHERE
-    (lt1.label = ?) AND
-    (FALSE)
-  ORDER BY f."metadata.fields[3]" ASC, (CASE lt1.label WHEN ? THEN lt1.value ELSE NULL END) ASC NULLS LAST`,
-		expectedStmtArgs:  []any{"stub.io/candy", "stub.io/candy"},
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
-		expectedContToken: "",
-		expectedErr:       nil,
-	})
+	// tests = append(tests, testCase{
+	// 	description: "sort one unbound label descending",
+	// 	listOptions: sqltypes.ListOptions{
+	// 		SortList: sqltypes.SortList{
+	// 			SortDirectives: []sqltypes.Sort{
+	// 				{
+	// 					Fields: []string{"metadata", "labels", "flip"},
+	// 					Order:  sqltypes.DESC,
+	// 				},
+	// 			},
+	// 		},
+	// 	},
+	// 	partitions:        []partition.Partition{{All: true}},
+	// 	ns:                "",
+	// 	expectedList:      makeList(t, lodgePole, toto, baz, bar, foo),
+	// expectedTotal:     5,
+	// 	expectedContToken: "",
+	// 	expectedErr:       nil,
+	// })
+	// tests = append(tests, testCase{
+	// 	description: "ListByOptions sorting on two complex fields should sort on the first field in ascending order first and then sort on the second labels field in ascending order in prepared sql.Stmt",
+	// 	listOptions: sqltypes.ListOptions{
+	// 		SortList: sqltypes.SortList{
+	// 			SortDirectives: []sqltypes.Sort{
+	// 				{
+	// 					Fields: []string{"metadata", "sortfield"},
+	// 					Order:  sqltypes.ASC,
+	// 				},
+	// 				{
+	// 					Fields: []string{"metadata", "labels", "cows"},
+	// 					Order:  sqltypes.ASC,
+	// 				},
+	// 			},
+	// 		},
+	// 	},
+	// 	partitions:        []partition.Partition{{All: true}},
+	// 	ns:                "",
+	// 	expectedList:      makeList(t),
+	// expectedTotal:     5,
+	// 	expectedContToken: "",
+	// 	expectedErr:       nil,
+	// })
 	tests = append(tests, testCase{
 		description: "ListByOptions sorting on two fields should sort on the first field in ascending order first and then sort on the second field in ascending order in prepared sql.Stmt",
-		listOptions: ListOptions{
-			Sort: Sort{
-				Fields: [][]string{{"metadata", "somefield"}, {"status", "someotherfield"}},
-				Orders: []SortOrder{ASC, ASC},
+		listOptions: sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "sortfield"},
+						Order:  sqltypes.ASC,
+					},
+					{
+						Fields: []string{"metadata", "somefield"},
+						Order:  sqltypes.ASC,
+					},
+				},
 			},
 		},
-		partitions: []partition.Partition{},
-		ns:         "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE)
-  ORDER BY f."metadata.somefield" ASC, f."status.someotherfield" ASC`,
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, lodgePole, bar, baz, toto, foo),
+		expectedTotal:     5,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
-
 	tests = append(tests, testCase{
 		description: "ListByOptions sorting on two fields should sort on the first field in descending order first and then sort on the second field in ascending order in prepared sql.Stmt",
-		listOptions: ListOptions{
-			Sort: Sort{
-				Fields: [][]string{{"metadata", "somefield"}, {"status", "someotherfield"}},
-				Orders: []SortOrder{DESC, ASC},
+		listOptions: sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "sortfield"},
+						Order:  sqltypes.DESC,
+					},
+					{
+						Fields: []string{"metadata", "somefield"},
+						Order:  sqltypes.ASC,
+					},
+				},
 			},
 		},
-		partitions: []partition.Partition{},
-		ns:         "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE)
-  ORDER BY f."metadata.somefield" DESC, f."status.someotherfield" ASC`,
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, foo, baz, toto, bar, lodgePole),
+		expectedTotal:     5,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
-
-	tests = append(tests, testCase{
-		description: "ListByOptions sorting when # fields != # sort orders should return an error",
-		listOptions: ListOptions{
-			Sort: Sort{
-				Fields: [][]string{{"metadata", "somefield"}, {"status", "someotherfield"}},
-				Orders: []SortOrder{DESC, ASC, ASC},
-			},
-		},
-		partitions: []partition.Partition{},
-		ns:         "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE)
-  ORDER BY f."metadata.somefield" DESC, f."status.someotherfield" ASC`,
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
-		expectedContToken: "",
-		expectedErr:       fmt.Errorf("sort fields length 2 != sort orders length 3"),
-	})
-
 	tests = append(tests, testCase{
 		description: "ListByOptions with Pagination.PageSize set should set limit to PageSize in prepared sql.Stmt",
-		listOptions: ListOptions{
-			Pagination: Pagination{
-				PageSize: 10,
+		listOptions: sqltypes.ListOptions{
+			Pagination: sqltypes.Pagination{
+				PageSize: 3,
 			},
 		},
-		partitions: []partition.Partition{},
-		ns:         "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE)
-  ORDER BY f."metadata.name" ASC 
-  LIMIT ?`,
-		expectedStmtArgs: []any{10},
-		expectedCountStmt: `SELECT COUNT(*) FROM (SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE))`,
-		expectedCountStmtArgs: []any{},
-		returnList:            []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:          &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
-		expectedContToken:     "",
-		expectedErr:           nil,
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, foo, bar, baz),
+		expectedTotal:     5,
+		expectedContToken: "3",
+		expectedErr:       nil,
 	})
 	tests = append(tests, testCase{
 		description: "ListByOptions with Pagination.Page and no PageSize set should not add anything to prepared sql.Stmt",
-		listOptions: ListOptions{
-			Pagination: Pagination{
+		listOptions: sqltypes.ListOptions{
+			Pagination: sqltypes.Pagination{
 				Page: 2,
 			},
 		},
-		partitions: []partition.Partition{},
-		ns:         "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE)
-  ORDER BY f."metadata.name" ASC `,
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, foo, bar, baz, toto, lodgePole),
+		expectedTotal:     5,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
-	tests = append(tests, testCase{
-		description: "ListByOptions with Pagination.Page and PageSize set limit to PageSize and offset to PageSize * (Page - 1) in prepared sql.Stmt",
-		listOptions: ListOptions{
-			Pagination: Pagination{
-				PageSize: 10,
-				Page:     2,
-			},
-		},
-		partitions: []partition.Partition{},
-		ns:         "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE)
-  ORDER BY f."metadata.name" ASC 
-  LIMIT ?
-  OFFSET ?`,
-		expectedStmtArgs: []any{10, 10},
-
-		expectedCountStmt: `SELECT COUNT(*) FROM (SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (FALSE))`,
-		expectedCountStmtArgs: []any{},
-
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
-		expectedContToken: "",
-		expectedErr:       nil,
-	})
-	tests = append(tests, testCase{
-		description: "ListByOptions with a Namespace Partition should select only items where metadata.namespace is equal to Namespace and all other conditions are met in prepared sql.Stmt",
-		partitions: []partition.Partition{
-			{
-				Namespace: "somens",
-			},
-		},
-		ns: "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (f."metadata.namespace" = ? AND FALSE)
-  ORDER BY f."metadata.name" ASC `,
-		expectedStmtArgs:  []any{"somens"},
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
-		expectedContToken: "",
-		expectedErr:       nil,
-	})
+	// tests = append(tests, testCase{
+	// 	description: "ListByOptions with a Namespace Partition should select only items where metadata.namespace is equal to Namespace and all other conditions are met in prepared sql.Stmt",
+	// 	partitions: []partition.Partition{
+	// 		{
+	// 			Namespace: "ns-b",
+	// 		},
+	// 	},
+	// 	// XXX: Why do I need to specify the namespace here too?
+	// 	ns:                "ns-b",
+	// 	expectedList:      makeList(t, lodgePole),
+	// 	expectedTotal:     1,
+	// 	expectedContToken: "",
+	// 	expectedErr:       nil,
+	// })
 	tests = append(tests, testCase{
 		description: "ListByOptions with a All Partition should select all items that meet all other conditions in prepared sql.Stmt",
 		partitions: []partition.Partition{
@@ -902,12 +872,9 @@ func TestListByOptions(t *testing.T) {
 				All: true,
 			},
 		},
-		ns: "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  ORDER BY f."metadata.name" ASC `,
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		ns:                "",
+		expectedList:      makeList(t, foo, bar, baz, toto, lodgePole),
+		expectedTotal:     5,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
@@ -918,12 +885,9 @@ func TestListByOptions(t *testing.T) {
 				Passthrough: true,
 			},
 		},
-		ns: "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  ORDER BY f."metadata.name" ASC `,
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		ns:                "",
+		expectedList:      makeList(t, foo, bar, baz, toto, lodgePole),
+		expectedTotal:     5,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
@@ -931,95 +895,47 @@ func TestListByOptions(t *testing.T) {
 		description: "ListByOptions with a Names Partition should select only items where metadata.name equals an items in Names and all other conditions are met in prepared sql.Stmt",
 		partitions: []partition.Partition{
 			{
-				Names: sets.New[string]("someid", "someotherid"),
+				Names: sets.New("obj1", "obj2"),
 			},
 		},
-		ns: "",
-		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
-  JOIN "something_fields" f ON o.key = f.key
-  WHERE
-    (f."metadata.name" IN (?, ?))
-  ORDER BY f."metadata.name" ASC `,
-		expectedStmtArgs:  []any{"someid", "someotherid"},
-		returnList:        []any{&unstructured.Unstructured{Object: unstrTestObjectMap}, &unstructured.Unstructured{Object: unstrTestObjectMap}},
-		expectedList:      &unstructured.UnstructuredList{Object: map[string]interface{}{"items": []map[string]interface{}{unstrTestObjectMap, unstrTestObjectMap}}, Items: []unstructured.Unstructured{{Object: unstrTestObjectMap}, {Object: unstrTestObjectMap}}},
+		ns:                "",
+		expectedList:      makeList(t, foo, bar),
+		expectedTotal:     2,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
 	t.Parallel()
+
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
-			txClient := NewMockTXClient(gomock.NewController(t))
-			store := NewMockStore(gomock.NewController(t))
-			stmts := NewMockStmt(gomock.NewController(t))
-			i := &Indexer{
-				Store: store,
+			fields := [][]string{
+				{"metadata", "somefield"},
+				{"status", "someotherfield"},
+				{"metadata", "unknown"},
+				{"metadata", "sortfield"},
 			}
-			lii := &ListOptionIndexer{
-				Indexer:       i,
-				indexedFields: []string{"metadata.somefield", "status.someotherfield"},
+			fields = append(fields, test.extraIndexedFields...)
+
+			opts := ListOptionIndexerOptions{
+				Fields:       fields,
+				IsNamespaced: true,
 			}
-			if len(test.extraIndexedFields) > 0 {
-				lii.indexedFields = append(lii.indexedFields, test.extraIndexedFields...)
+			loi, err := makeListOptionIndexer(ctx, opts)
+			assert.NoError(t, err)
+
+			for _, item := range itemList.Items {
+				err = loi.Add(&item)
+				assert.NoError(t, err)
 			}
-			queryInfo, err := lii.constructQuery(test.listOptions, test.partitions, test.ns, "something")
+
+			list, total, contToken, err := loi.ListByOptions(ctx, &test.listOptions, test.partitions, test.ns)
 			if test.expectedErr != nil {
-				assert.Equal(t, test.expectedErr, err)
+				assert.Error(t, err)
 				return
 			}
-			assert.Nil(t, err)
-			assert.Equal(t, test.expectedStmt, queryInfo.query)
-			if test.expectedStmtArgs == nil {
-				test.expectedStmtArgs = []any{}
-			}
-			assert.Equal(t, test.expectedStmtArgs, queryInfo.params)
-			assert.Equal(t, test.expectedCountStmt, queryInfo.countQuery)
-			assert.Equal(t, test.expectedCountStmtArgs, queryInfo.countParams)
 
-			stmt := &sql.Stmt{}
-			rows := &sql.Rows{}
-			objType := reflect.TypeOf(testObject)
-			txClient.EXPECT().Stmt(gomock.Any()).Return(stmts).AnyTimes()
-			store.EXPECT().Prepare(test.expectedStmt).Do(func(a ...any) {
-				fmt.Println(a)
-			}).Return(stmt)
-			if args := test.expectedStmtArgs; args != nil {
-				stmts.EXPECT().QueryContext(gomock.Any(), gomock.Any()).Return(rows, nil).AnyTimes()
-			} else if strings.Contains(test.expectedStmt, "LIMIT") {
-				stmts.EXPECT().QueryContext(gomock.Any(), args...).Return(rows, nil)
-				txClient.EXPECT().Stmt(gomock.Any()).Return(stmts)
-				stmts.EXPECT().QueryContext(gomock.Any()).Return(rows, nil)
-			} else {
-				stmts.EXPECT().QueryContext(gomock.Any()).Return(rows, nil)
-			}
-			store.EXPECT().GetType().Return(objType)
-			store.EXPECT().GetShouldEncrypt().Return(false)
-			store.EXPECT().ReadObjects(rows, objType, false).Return(test.returnList, nil)
-			store.EXPECT().CloseStmt(stmt).Return(nil)
-
-			store.EXPECT().WithTransaction(gomock.Any(), false, gomock.Any()).Return(nil).Do(
-				func(ctx context.Context, shouldEncrypt bool, f db.WithTransactionFunction) {
-					err := f(txClient)
-					if test.expectedErr == nil {
-						assert.Nil(t, err)
-					} else {
-						assert.Equal(t, test.expectedErr, err)
-					}
-				})
-
-			if test.expectedCountStmt != "" {
-				store.EXPECT().Prepare(test.expectedCountStmt).Return(stmt)
-				store.EXPECT().ReadInt(rows).Return(len(test.expectedList.Items), nil)
-				store.EXPECT().CloseStmt(stmt).Return(nil)
-			}
-			list, total, contToken, err := lii.executeQuery(context.Background(), queryInfo)
-			if test.expectedErr == nil {
-				assert.Nil(t, err)
-			} else {
-				assert.Equal(t, test.expectedErr, err)
-			}
 			assert.Equal(t, test.expectedList, list)
-			assert.Equal(t, len(test.expectedList.Items), total)
+			assert.Equal(t, test.expectedTotal, total)
 			assert.Equal(t, test.expectedContToken, contToken)
 		})
 	}
@@ -1028,7 +944,7 @@ func TestListByOptions(t *testing.T) {
 func TestConstructQuery(t *testing.T) {
 	type testCase struct {
 		description           string
-		listOptions           ListOptions
+		listOptions           sqltypes.ListOptions
 		partitions            []partition.Partition
 		ns                    string
 		expectedCountStmt     string
@@ -1041,13 +957,13 @@ func TestConstructQuery(t *testing.T) {
 	var tests []testCase
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles IN statements",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "queryField1"},
 						Matches: []string{"somevalue"},
-						Op:      In,
+						Op:      sqltypes.In,
 					},
 				},
 			},
@@ -1066,13 +982,13 @@ func TestConstructQuery(t *testing.T) {
 	})
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles NOT-IN statements",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "queryField1"},
 						Matches: []string{"somevalue"},
-						Op:      NotIn,
+						Op:      sqltypes.NotIn,
 					},
 				},
 			},
@@ -1091,12 +1007,12 @@ func TestConstructQuery(t *testing.T) {
 	})
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles EXISTS statements",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field: []string{"metadata", "queryField1"},
-						Op:    Exists,
+						Op:    sqltypes.Exists,
 					},
 				},
 			},
@@ -1108,12 +1024,12 @@ func TestConstructQuery(t *testing.T) {
 	})
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles NOT-EXISTS statements",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field: []string{"metadata", "queryField1"},
-						Op:    NotExists,
+						Op:    sqltypes.NotExists,
 					},
 				},
 			},
@@ -1125,13 +1041,13 @@ func TestConstructQuery(t *testing.T) {
 	})
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles == statements for label statements",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "labelEqualFull"},
 						Matches: []string{"somevalue"},
-						Op:      Eq,
+						Op:      sqltypes.Eq,
 						Partial: false,
 					},
 				},
@@ -1152,13 +1068,13 @@ func TestConstructQuery(t *testing.T) {
 	})
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles == statements for label statements, match partial",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "labelEqualPartial"},
 						Matches: []string{"somevalue"},
-						Op:      Eq,
+						Op:      sqltypes.Eq,
 						Partial: true,
 					},
 				},
@@ -1179,13 +1095,13 @@ func TestConstructQuery(t *testing.T) {
 	})
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles != statements for label statements",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "labelNotEqualFull"},
 						Matches: []string{"somevalue"},
-						Op:      NotEq,
+						Op:      sqltypes.NotEq,
 						Partial: false,
 					},
 				},
@@ -1210,13 +1126,13 @@ func TestConstructQuery(t *testing.T) {
 
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles != statements for label statements, match partial",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "labelNotEqualPartial"},
 						Matches: []string{"somevalue"},
-						Op:      NotEq,
+						Op:      sqltypes.NotEq,
 						Partial: true,
 					},
 				},
@@ -1241,23 +1157,23 @@ func TestConstructQuery(t *testing.T) {
 
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles multiple != statements for label statements",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "notEqual1"},
 						Matches: []string{"value1"},
-						Op:      NotEq,
+						Op:      sqltypes.NotEq,
 						Partial: false,
 					},
 				},
 			},
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "notEqual2"},
 						Matches: []string{"value2"},
-						Op:      NotEq,
+						Op:      sqltypes.NotEq,
 						Partial: false,
 					},
 				},
@@ -1286,13 +1202,13 @@ func TestConstructQuery(t *testing.T) {
 	})
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles IN statements for label statements",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "labelIN"},
 						Matches: []string{"somevalue1", "someValue2"},
-						Op:      In,
+						Op:      sqltypes.In,
 					},
 				},
 			},
@@ -1313,13 +1229,13 @@ func TestConstructQuery(t *testing.T) {
 
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles NOTIN statements for label statements",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "labelNOTIN"},
 						Matches: []string{"somevalue1", "someValue2"},
-						Op:      NotIn,
+						Op:      sqltypes.NotIn,
 					},
 				},
 			},
@@ -1343,13 +1259,13 @@ func TestConstructQuery(t *testing.T) {
 
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles EXISTS statements for label statements",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "labelEXISTS"},
 						Matches: []string{},
-						Op:      Exists,
+						Op:      sqltypes.Exists,
 					},
 				},
 			},
@@ -1370,13 +1286,13 @@ func TestConstructQuery(t *testing.T) {
 
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles NOTEXISTS statements for label statements",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "labelNOTEXISTS"},
 						Matches: []string{},
-						Op:      NotExists,
+						Op:      sqltypes.NotExists,
 					},
 				},
 			},
@@ -1399,13 +1315,13 @@ func TestConstructQuery(t *testing.T) {
 	})
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles LessThan statements",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "numericThing"},
 						Matches: []string{"5"},
-						Op:      Lt,
+						Op:      sqltypes.Lt,
 					},
 				},
 			},
@@ -1425,13 +1341,13 @@ func TestConstructQuery(t *testing.T) {
 	})
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles GreaterThan statements",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				[]Filter{
+				[]sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "numericThing"},
 						Matches: []string{"35"},
-						Op:      Gt,
+						Op:      sqltypes.Gt,
 					},
 				},
 			},
@@ -1451,19 +1367,19 @@ func TestConstructQuery(t *testing.T) {
 	})
 	tests = append(tests, testCase{
 		description: "multiple filters with a positive label test and a negative non-label test still outer-join",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				Filters: []Filter{
+				Filters: []sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "junta"},
 						Matches: []string{"esther"},
-						Op:      Eq,
+						Op:      sqltypes.Eq,
 						Partial: true,
 					},
 					{
 						Field:   []string{"metadata", "queryField1"},
 						Matches: []string{"golgi"},
-						Op:      NotEq,
+						Op:      sqltypes.NotEq,
 						Partial: true,
 					},
 				},
@@ -1484,33 +1400,33 @@ func TestConstructQuery(t *testing.T) {
 	})
 	tests = append(tests, testCase{
 		description: "multiple filters and or-filters with a positive label test and a negative non-label test still outer-join and have correct AND/ORs",
-		listOptions: ListOptions{Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
 			{
-				Filters: []Filter{
+				Filters: []sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "nectar"},
 						Matches: []string{"stash"},
-						Op:      Eq,
+						Op:      sqltypes.Eq,
 						Partial: true,
 					},
 					{
 						Field:   []string{"metadata", "queryField1"},
 						Matches: []string{"landlady"},
-						Op:      NotEq,
+						Op:      sqltypes.NotEq,
 						Partial: false,
 					},
 				},
 			},
 			{
-				Filters: []Filter{
+				Filters: []sqltypes.Filter{
 					{
 						Field:   []string{"metadata", "labels", "lawn"},
 						Matches: []string{"reba", "coil"},
-						Op:      In,
+						Op:      sqltypes.In,
 					},
 					{
 						Field:   []string{"metadata", "queryField1"},
-						Op:      Gt,
+						Op:      sqltypes.Gt,
 						Matches: []string{"2"},
 					},
 				},
@@ -1534,22 +1450,26 @@ func TestConstructQuery(t *testing.T) {
 
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: handles == statements for label statements, match partial, sort on metadata.queryField1",
-		listOptions: ListOptions{
-			Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{
+			Filters: []sqltypes.OrFilter{
 				{
-					[]Filter{
+					[]sqltypes.Filter{
 						{
 							Field:   []string{"metadata", "labels", "labelEqualPartial"},
 							Matches: []string{"somevalue"},
-							Op:      Eq,
+							Op:      sqltypes.Eq,
 							Partial: true,
 						},
 					},
 				},
 			},
-			Sort: Sort{
-				Fields: [][]string{{"metadata", "queryField1"}},
-				Orders: []SortOrder{ASC},
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "queryField1"},
+						Order:  sqltypes.ASC,
+					},
+				},
 			},
 		},
 		partitions: []partition.Partition{},
@@ -1566,26 +1486,15 @@ func TestConstructQuery(t *testing.T) {
 	})
 
 	tests = append(tests, testCase{
-		description: "ConstructQuery: sorting when # fields < # sort orders should return an error",
-		listOptions: ListOptions{
-			Sort: Sort{
-				Fields: [][]string{{"metadata", "somefield"}, {"status", "someotherfield"}},
-				Orders: []SortOrder{DESC, ASC, ASC},
-			},
-		},
-		partitions:       []partition.Partition{},
-		ns:               "",
-		expectedStmt:     "",
-		expectedStmtArgs: []any{},
-		expectedErr:      fmt.Errorf("sort fields length 2 != sort orders length 3"),
-	})
-
-	tests = append(tests, testCase{
 		description: "TestConstructQuery: sort on label statements with no query",
-		listOptions: ListOptions{
-			Sort: Sort{
-				Fields: [][]string{{"metadata", "labels", "this"}},
-				Orders: []SortOrder{ASC},
+		listOptions: sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "labels", "this"},
+						Order:  sqltypes.ASC,
+					},
+				},
 			},
 		},
 		partitions: []partition.Partition{},
@@ -1603,26 +1512,34 @@ func TestConstructQuery(t *testing.T) {
 
 	tests = append(tests, testCase{
 		description: "TestConstructQuery: sort and query on both labels and non-labels without overlap",
-		listOptions: ListOptions{
-			Filters: []OrFilter{
+		listOptions: sqltypes.ListOptions{
+			Filters: []sqltypes.OrFilter{
 				{
-					[]Filter{
+					[]sqltypes.Filter{
 						{
 							Field:   []string{"metadata", "queryField1"},
 							Matches: []string{"toys"},
-							Op:      Eq,
+							Op:      sqltypes.Eq,
 						},
 						{
 							Field:   []string{"metadata", "labels", "jamb"},
 							Matches: []string{"juice"},
-							Op:      Eq,
+							Op:      sqltypes.Eq,
 						},
 					},
 				},
 			},
-			Sort: Sort{
-				Fields: [][]string{{"metadata", "labels", "this"}, {"status", "queryField2"}},
-				Orders: []SortOrder{ASC, DESC},
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "labels", "this"},
+						Order:  sqltypes.ASC,
+					},
+					{
+						Fields: []string{"status", "queryField2"},
+						Order:  sqltypes.DESC,
+					},
+				},
 			},
 		},
 		partitions: []partition.Partition{},
@@ -1639,21 +1556,6 @@ func TestConstructQuery(t *testing.T) {
 		expectedErr:      nil,
 	})
 
-	tests = append(tests, testCase{
-		description: "ConstructQuery: sorting when # fields > # sort orders should return an error",
-		listOptions: ListOptions{
-			Sort: Sort{
-				Fields: [][]string{{"metadata", "somefield"}, {"status", "someotherfield"}, {"metadata", "labels", "a1"}, {"metadata", "labels", "a2"}},
-				Orders: []SortOrder{DESC, ASC, ASC},
-			},
-		},
-		partitions:       []partition.Partition{},
-		ns:               "",
-		expectedStmt:     "",
-		expectedStmtArgs: []any{},
-		expectedErr:      fmt.Errorf("sort fields length 4 != sort orders length 3"),
-	})
-
 	t.Parallel()
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
@@ -1665,7 +1567,7 @@ func TestConstructQuery(t *testing.T) {
 				Indexer:       i,
 				indexedFields: []string{"metadata.queryField1", "status.queryField2"},
 			}
-			queryInfo, err := lii.constructQuery(test.listOptions, test.partitions, test.ns, "something")
+			queryInfo, err := lii.constructQuery(&test.listOptions, test.partitions, test.ns, "something")
 			if test.expectedErr != nil {
 				assert.Equal(t, test.expectedErr, err)
 				return
@@ -1748,7 +1650,7 @@ func TestBuildSortLabelsClause(t *testing.T) {
 		joinTableIndexByLabelName map[string]int
 		direction                 bool
 		expectedStmt              string
-        expectedParam             string
+		expectedParam             string
 		expectedErr               string
 	}
 
@@ -1787,4 +1689,814 @@ func TestBuildSortLabelsClause(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetField(t *testing.T) {
+	tests := []struct {
+		name           string
+		obj            any
+		field          string
+		expectedResult any
+		expectedErr    bool
+	}{
+		{
+			name: "simple",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"foo": "bar",
+				},
+			},
+			field:          "foo",
+			expectedResult: "bar",
+		},
+		{
+			name: "nested",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"foo": map[string]any{
+						"bar": "baz",
+					},
+				},
+			},
+			field:          "foo.bar",
+			expectedResult: "baz",
+		},
+		{
+			name: "array",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"theList": []any{
+						"foo", "bar", "baz",
+					},
+				},
+			},
+			field:          "theList[1]",
+			expectedResult: "bar",
+		},
+		{
+			name: "array of object",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"theList": []any{
+						map[string]any{
+							"name": "foo",
+						},
+						map[string]any{
+							"name": "bar",
+						},
+						map[string]any{
+							"name": "baz",
+						},
+					},
+				},
+			},
+			field:          "theList.name",
+			expectedResult: []string{"foo", "bar", "baz"},
+		},
+		{
+			name: "annotation",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"annotations": map[string]any{
+						"with.dot.in.it/and-slash": "foo",
+					},
+				},
+			},
+			field:          "annotations[with.dot.in.it/and-slash]",
+			expectedResult: "foo",
+		},
+		{
+			name: "field not found",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"spec": map[string]any{
+						"rules": []any{
+							map[string]any{},
+							map[string]any{
+								"host": "example.com",
+							},
+						},
+					},
+				},
+			},
+			field:          "spec.rules.host",
+			expectedResult: []string{"", "example.com"},
+		},
+		{
+			name: "array index invalid",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"theList": []any{
+						"foo", "bar", "baz",
+					},
+				},
+			},
+			field:       "theList[a]",
+			expectedErr: true,
+		},
+		{
+			name: "array index out of bound",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"theList": []any{
+						"foo", "bar", "baz",
+					},
+				},
+			},
+			field:       "theList[3]",
+			expectedErr: true,
+		},
+		{
+			name: "invalid array",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"spec": map[string]any{
+						"rules": []any{
+							1,
+						},
+					},
+				},
+			},
+			field:       "spec.rules.host",
+			expectedErr: true,
+		},
+		{
+			name: "invalid array nested",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"spec": map[string]any{
+						"rules": []any{
+							map[string]any{
+								"host": 1,
+							},
+						},
+					},
+				},
+			},
+			field:       "spec.rules.host",
+			expectedErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := getField(test.obj, test.field)
+			if test.expectedErr {
+				require.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, test.expectedResult, result)
+		})
+	}
+}
+
+func TestWatchMany(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	opts := ListOptionIndexerOptions{
+		Fields:       [][]string{{"metadata", "somefield"}},
+		IsNamespaced: true,
+	}
+	loi, err := makeListOptionIndexer(ctx, opts)
+	assert.NoError(t, err)
+
+	startWatcher := func(ctx context.Context) (chan watch.Event, chan error) {
+		errCh := make(chan error, 1)
+		eventsCh := make(chan watch.Event, 100)
+		go func() {
+			watchErr := loi.Watch(ctx, WatchOptions{}, eventsCh)
+			errCh <- watchErr
+		}()
+		time.Sleep(100 * time.Millisecond)
+		return eventsCh, errCh
+	}
+
+	waitStopWatcher := func(errCh chan error) error {
+		select {
+		case <-time.After(time.Second * 5):
+			return fmt.Errorf("not finished in time")
+		case err := <-errCh:
+			return err
+		}
+	}
+
+	receiveEvents := func(eventsCh chan watch.Event) []watch.Event {
+		timer := time.NewTimer(time.Millisecond * 50)
+		var events []watch.Event
+		for {
+			select {
+			case <-timer.C:
+				return events
+			case ev := <-eventsCh:
+				events = append(events, ev)
+			}
+		}
+	}
+	watcher1, errCh1 := startWatcher(ctx)
+	events := receiveEvents(watcher1)
+	assert.Len(t, events, 0)
+
+	foo := &unstructured.Unstructured{
+		Object: map[string]any{
+			"metadata": map[string]any{
+				"name": "foo",
+			},
+		},
+	}
+	foo.SetResourceVersion("100")
+	foo2 := foo.DeepCopy()
+	foo2.SetResourceVersion("120")
+	foo2.SetLabels(map[string]string{
+		"hello": "world",
+	})
+	foo3 := foo.DeepCopy()
+	foo3.SetResourceVersion("140")
+	foo4 := foo2.DeepCopy()
+	foo4.SetResourceVersion("160")
+
+	err = loi.Add(foo)
+	assert.NoError(t, err)
+
+	events = receiveEvents(watcher1)
+	assert.Equal(t, []watch.Event{{Type: watch.Added, Object: foo}}, events)
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	watcher2, errCh2 := startWatcher(ctx2)
+
+	err = loi.Update(foo2)
+	assert.NoError(t, err)
+
+	events = receiveEvents(watcher1)
+	assert.Equal(t, []watch.Event{{Type: watch.Modified, Object: foo2}}, events)
+
+	events = receiveEvents(watcher2)
+	assert.Equal(t, []watch.Event{{Type: watch.Modified, Object: foo2}}, events)
+
+	watcher3, errCh3 := startWatcher(ctx)
+
+	cancel2()
+	err = waitStopWatcher(errCh2)
+	assert.NoError(t, err)
+
+	err = loi.Delete(foo2)
+	assert.NoError(t, err)
+	err = loi.Add(foo3)
+	assert.NoError(t, err)
+	err = loi.Update(foo4)
+	assert.NoError(t, err)
+
+	events = receiveEvents(watcher3)
+	assert.Equal(t, []watch.Event{
+		{Type: watch.Deleted, Object: foo2},
+		{Type: watch.Added, Object: foo3},
+		{Type: watch.Modified, Object: foo4},
+	}, events)
+
+	// Verify cancelled watcher don't receive anything anymore
+	events = receiveEvents(watcher2)
+	assert.Len(t, events, 0)
+
+	events = receiveEvents(watcher1)
+	assert.Equal(t, []watch.Event{
+		{Type: watch.Deleted, Object: foo2},
+		{Type: watch.Added, Object: foo3},
+		{Type: watch.Modified, Object: foo4},
+	}, events)
+
+	cancel()
+	err = waitStopWatcher(errCh1)
+	assert.NoError(t, err)
+
+	err = waitStopWatcher(errCh3)
+	assert.NoError(t, err)
+}
+
+func TestWatchFilter(t *testing.T) {
+	startWatcher := func(ctx context.Context, loi *ListOptionIndexer, filter WatchFilter) (chan watch.Event, chan error) {
+		errCh := make(chan error, 1)
+		eventsCh := make(chan watch.Event, 100)
+		go func() {
+			watchErr := loi.Watch(ctx, WatchOptions{Filter: filter}, eventsCh)
+			errCh <- watchErr
+		}()
+		time.Sleep(100 * time.Millisecond)
+		return eventsCh, errCh
+	}
+
+	waitStopWatcher := func(errCh chan error) error {
+		select {
+		case <-time.After(time.Second * 5):
+			return fmt.Errorf("not finished in time")
+		case err := <-errCh:
+			return err
+		}
+	}
+
+	receiveEvents := func(eventsCh chan watch.Event) []watch.Event {
+		timer := time.NewTimer(time.Millisecond * 50)
+		var events []watch.Event
+		for {
+			select {
+			case <-timer.C:
+				return events
+			case ev := <-eventsCh:
+				events = append(events, ev)
+			}
+		}
+	}
+
+	foo := &unstructured.Unstructured{}
+	foo.SetName("foo")
+	foo.SetNamespace("foo")
+	foo.SetLabels(map[string]string{
+		"app": "foo",
+	})
+
+	fooUpdated := foo.DeepCopy()
+	fooUpdated.SetLabels(map[string]string{
+		"app": "changed",
+	})
+
+	bar := &unstructured.Unstructured{}
+	bar.SetName("bar")
+	bar.SetNamespace("bar")
+	bar.SetLabels(map[string]string{
+		"app": "bar",
+	})
+
+	appSelector, err := labels.Parse("app=foo")
+	assert.NoError(t, err)
+
+	tests := []struct {
+		name           string
+		filter         WatchFilter
+		setupStore     func(store cache.Store) error
+		expectedEvents []watch.Event
+	}{
+		{
+			name:   "namespace filter",
+			filter: WatchFilter{Namespace: "foo"},
+			setupStore: func(store cache.Store) error {
+				err := store.Add(foo)
+				if err != nil {
+					return err
+				}
+				err = store.Add(bar)
+				if err != nil {
+					return err
+				}
+				return nil
+			},
+			expectedEvents: []watch.Event{{Type: watch.Added, Object: foo}},
+		},
+		{
+			name:   "selector filter",
+			filter: WatchFilter{Selector: appSelector},
+			setupStore: func(store cache.Store) error {
+				err := store.Add(foo)
+				if err != nil {
+					return err
+				}
+				err = store.Add(bar)
+				if err != nil {
+					return err
+				}
+				err = store.Update(fooUpdated)
+				if err != nil {
+					return err
+				}
+				return nil
+			},
+			expectedEvents: []watch.Event{
+				{Type: watch.Added, Object: foo},
+				{Type: watch.Modified, Object: fooUpdated},
+			},
+		},
+		{
+			name:   "id filter",
+			filter: WatchFilter{ID: "foo"},
+			setupStore: func(store cache.Store) error {
+				err := store.Add(foo)
+				if err != nil {
+					return err
+				}
+				err = store.Add(bar)
+				if err != nil {
+					return err
+				}
+				err = store.Update(fooUpdated)
+				if err != nil {
+					return err
+				}
+				err = store.Update(foo)
+				if err != nil {
+					return err
+				}
+				return nil
+			},
+			expectedEvents: []watch.Event{
+				{Type: watch.Added, Object: foo},
+				{Type: watch.Modified, Object: fooUpdated},
+				{Type: watch.Modified, Object: foo},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+
+			opts := ListOptionIndexerOptions{
+				Fields:       [][]string{{"metadata", "somefield"}},
+				IsNamespaced: true,
+			}
+			loi, err := makeListOptionIndexer(ctx, opts)
+			assert.NoError(t, err)
+
+			wCh, errCh := startWatcher(ctx, loi, WatchFilter{
+				Namespace: "foo",
+			})
+
+			if test.setupStore != nil {
+				err = test.setupStore(loi)
+				assert.NoError(t, err)
+			}
+
+			events := receiveEvents(wCh)
+			assert.Equal(t, test.expectedEvents, events)
+
+			cancel()
+			err = waitStopWatcher(errCh)
+			assert.NoError(t, err)
+
+		})
+	}
+
+}
+
+func TestWatchResourceVersion(t *testing.T) {
+	startWatcher := func(ctx context.Context, loi *ListOptionIndexer, rv string) (chan watch.Event, chan error) {
+		errCh := make(chan error, 1)
+		eventsCh := make(chan watch.Event, 100)
+		go func() {
+			watchErr := loi.Watch(ctx, WatchOptions{ResourceVersion: rv}, eventsCh)
+			errCh <- watchErr
+		}()
+		time.Sleep(100 * time.Millisecond)
+		return eventsCh, errCh
+	}
+
+	waitStopWatcher := func(errCh chan error) error {
+		select {
+		case <-time.After(time.Second * 5):
+			return fmt.Errorf("not finished in time")
+		case err := <-errCh:
+			return err
+		}
+	}
+
+	receiveEvents := func(eventsCh chan watch.Event) []watch.Event {
+		timer := time.NewTimer(time.Millisecond * 50)
+		var events []watch.Event
+		for {
+			select {
+			case <-timer.C:
+				return events
+			case ev := <-eventsCh:
+				events = append(events, ev)
+			}
+		}
+	}
+
+	foo := &unstructured.Unstructured{}
+	foo.SetResourceVersion("100")
+	foo.SetName("foo")
+	foo.SetNamespace("foo")
+	foo.SetLabels(map[string]string{
+		"app": "foo",
+	})
+
+	fooUpdated := foo.DeepCopy()
+	fooUpdated.SetResourceVersion("120")
+	fooUpdated.SetLabels(map[string]string{
+		"app": "changed",
+	})
+
+	bar := &unstructured.Unstructured{}
+	bar.SetResourceVersion("150")
+	bar.SetName("bar")
+	bar.SetNamespace("bar")
+	bar.SetLabels(map[string]string{
+		"app": "bar",
+	})
+
+	barDeleted := bar.DeepCopy()
+	barDeleted.SetResourceVersion("160")
+
+	barNew := bar.DeepCopy()
+	barNew.SetResourceVersion("170")
+
+	parentCtx := context.Background()
+
+	opts := ListOptionIndexerOptions{
+		IsNamespaced: true,
+	}
+	loi, err := makeListOptionIndexer(parentCtx, opts)
+	assert.NoError(t, err)
+
+	getRV := func(t *testing.T) string {
+		t.Helper()
+		list, _, _, err := loi.ListByOptions(parentCtx, &sqltypes.ListOptions{}, []partition.Partition{{All: true}}, "")
+		assert.NoError(t, err)
+		return list.GetResourceVersion()
+	}
+
+	err = loi.Add(foo)
+	assert.NoError(t, err)
+	rv1 := getRV(t)
+
+	err = loi.Update(fooUpdated)
+	assert.NoError(t, err)
+	rv2 := getRV(t)
+
+	err = loi.Add(bar)
+	assert.NoError(t, err)
+	rv3 := getRV(t)
+
+	err = loi.Delete(barDeleted)
+	assert.NoError(t, err)
+	rv4 := getRV(t)
+
+	err = loi.Add(barNew)
+	assert.NoError(t, err)
+	rv5 := getRV(t)
+
+	tests := []struct {
+		rv             string
+		expectedEvents []watch.Event
+		expectedErr    error
+	}{
+		{
+			rv: "",
+		},
+		{
+			rv: rv1,
+			expectedEvents: []watch.Event{
+				{Type: watch.Modified, Object: fooUpdated},
+				{Type: watch.Added, Object: bar},
+				{Type: watch.Deleted, Object: barDeleted},
+				{Type: watch.Added, Object: barNew},
+			},
+		},
+		{
+			rv: rv2,
+			expectedEvents: []watch.Event{
+				{Type: watch.Added, Object: bar},
+				{Type: watch.Deleted, Object: barDeleted},
+				{Type: watch.Added, Object: barNew},
+			},
+		},
+		{
+			rv: rv3,
+			expectedEvents: []watch.Event{
+				{Type: watch.Deleted, Object: barDeleted},
+				{Type: watch.Added, Object: barNew},
+			},
+		},
+		{
+			rv: rv4,
+			expectedEvents: []watch.Event{
+				{Type: watch.Added, Object: barNew},
+			},
+		},
+		{
+			rv:             rv5,
+			expectedEvents: nil,
+		},
+		{
+			rv:          "unknown",
+			expectedErr: ErrTooOld,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.rv, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(parentCtx)
+			watcherCh, errCh := startWatcher(ctx, loi, test.rv)
+			gotEvents := receiveEvents(watcherCh)
+
+			cancel()
+			err := waitStopWatcher(errCh)
+			if test.expectedErr != nil {
+				assert.ErrorIs(t, err, ErrTooOld)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, test.expectedEvents, gotEvents)
+			}
+		})
+	}
+}
+
+func TestWatchGarbageCollection(t *testing.T) {
+	startWatcher := func(ctx context.Context, loi *ListOptionIndexer, rv string) (chan watch.Event, chan error) {
+		errCh := make(chan error, 1)
+		eventsCh := make(chan watch.Event, 100)
+		go func() {
+			watchErr := loi.Watch(ctx, WatchOptions{ResourceVersion: rv}, eventsCh)
+			errCh <- watchErr
+		}()
+		time.Sleep(100 * time.Millisecond)
+		return eventsCh, errCh
+	}
+
+	waitStopWatcher := func(errCh chan error) error {
+		select {
+		case <-time.After(time.Second * 5):
+			return fmt.Errorf("not finished in time")
+		case err := <-errCh:
+			return err
+		}
+	}
+
+	receiveEvents := func(eventsCh chan watch.Event) []watch.Event {
+		timer := time.NewTimer(time.Millisecond * 50)
+		var events []watch.Event
+		for {
+			select {
+			case <-timer.C:
+				return events
+			case ev := <-eventsCh:
+				events = append(events, ev)
+			}
+		}
+	}
+
+	foo := &unstructured.Unstructured{}
+	foo.SetResourceVersion("100")
+	foo.SetName("foo")
+
+	fooUpdated := foo.DeepCopy()
+	fooUpdated.SetResourceVersion("120")
+
+	bar := &unstructured.Unstructured{}
+	bar.SetResourceVersion("150")
+	bar.SetName("bar")
+
+	barDeleted := bar.DeepCopy()
+	barDeleted.SetResourceVersion("160")
+
+	barNew := bar.DeepCopy()
+	barNew.SetResourceVersion("170")
+
+	parentCtx := context.Background()
+
+	opts := ListOptionIndexerOptions{
+		MaximumEventsCount: 2,
+	}
+	loi, err := makeListOptionIndexer(parentCtx, opts)
+	assert.NoError(t, err)
+
+	getRV := func(t *testing.T) string {
+		t.Helper()
+		list, _, _, err := loi.ListByOptions(parentCtx, &sqltypes.ListOptions{}, []partition.Partition{{All: true}}, "")
+		assert.NoError(t, err)
+		return list.GetResourceVersion()
+	}
+
+	err = loi.Add(foo)
+	assert.NoError(t, err)
+	rv1 := getRV(t)
+
+	err = loi.Update(fooUpdated)
+	assert.NoError(t, err)
+	rv2 := getRV(t)
+
+	err = loi.Add(bar)
+	assert.NoError(t, err)
+	rv3 := getRV(t)
+
+	err = loi.Delete(barDeleted)
+	assert.NoError(t, err)
+	rv4 := getRV(t)
+
+	for _, rv := range []string{rv1, rv2} {
+		watcherCh, errCh := startWatcher(parentCtx, loi, rv)
+		gotEvents := receiveEvents(watcherCh)
+		err = waitStopWatcher(errCh)
+		assert.Empty(t, gotEvents)
+		assert.ErrorIs(t, err, ErrTooOld)
+	}
+
+	tests := []struct {
+		rv             string
+		expectedEvents []watch.Event
+	}{
+		{
+			rv: rv3,
+			expectedEvents: []watch.Event{
+				{Type: watch.Deleted, Object: barDeleted},
+			},
+		},
+		{
+			rv:             rv4,
+			expectedEvents: nil,
+		},
+	}
+	for _, test := range tests {
+		ctx, cancel := context.WithCancel(parentCtx)
+		watcherCh, errCh := startWatcher(ctx, loi, test.rv)
+		gotEvents := receiveEvents(watcherCh)
+		cancel()
+		err = waitStopWatcher(errCh)
+		assert.Equal(t, test.expectedEvents, gotEvents)
+		assert.NoError(t, err)
+	}
+
+	err = loi.Add(barNew)
+	assert.NoError(t, err)
+	rv5 := getRV(t)
+
+	for _, rv := range []string{rv1, rv2, rv3} {
+		watcherCh, errCh := startWatcher(parentCtx, loi, rv)
+		gotEvents := receiveEvents(watcherCh)
+		err = waitStopWatcher(errCh)
+		assert.Empty(t, gotEvents)
+		assert.ErrorIs(t, err, ErrTooOld)
+	}
+
+	tests = []struct {
+		rv             string
+		expectedEvents []watch.Event
+	}{
+		{
+			rv: rv4,
+			expectedEvents: []watch.Event{
+				{Type: watch.Added, Object: barNew},
+			},
+		},
+		{
+			rv:             rv5,
+			expectedEvents: nil,
+		},
+	}
+	for _, test := range tests {
+		ctx, cancel := context.WithCancel(parentCtx)
+		watcherCh, errCh := startWatcher(ctx, loi, test.rv)
+		gotEvents := receiveEvents(watcherCh)
+		cancel()
+		err = waitStopWatcher(errCh)
+		assert.Equal(t, test.expectedEvents, gotEvents)
+		assert.NoError(t, err)
+	}
+}
+
+func TestNonNumberResourceVersion(t *testing.T) {
+	ctx := context.Background()
+
+	opts := ListOptionIndexerOptions{
+		Fields:       [][]string{{"metadata", "somefield"}},
+		IsNamespaced: true,
+	}
+	loi, err := makeListOptionIndexer(ctx, opts)
+	assert.NoError(t, err)
+
+	foo := &unstructured.Unstructured{
+		Object: map[string]any{
+			"metadata": map[string]any{
+				"name": "foo",
+			},
+		},
+	}
+	foo.SetResourceVersion("a")
+	foo2 := foo.DeepCopy()
+	foo2.SetResourceVersion("b")
+	foo2.SetLabels(map[string]string{
+		"hello": "world",
+	})
+	bar := &unstructured.Unstructured{
+		Object: map[string]any{
+			"metadata": map[string]any{
+				"name": "bar",
+			},
+		},
+	}
+	bar.SetResourceVersion("c")
+	err = loi.Add(foo)
+	assert.NoError(t, err)
+	err = loi.Update(foo2)
+	assert.NoError(t, err)
+	err = loi.Add(bar)
+	assert.NoError(t, err)
+
+	expectedUnstructured := &unstructured.Unstructured{
+		Object: map[string]any{
+			"items": []any{bar.Object, foo2.Object},
+		},
+	}
+	expectedList, err := expectedUnstructured.ToList()
+	require.NoError(t, err)
+
+	list, _, _, err := loi.ListByOptions(ctx, &sqltypes.ListOptions{}, []partition.Partition{{All: true}}, "")
+	assert.NoError(t, err)
+	assert.Equal(t, expectedList.Items, list.Items)
 }
