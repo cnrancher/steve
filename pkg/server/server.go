@@ -44,6 +44,8 @@ type ExtensionAPIServer interface {
 	http.Handler
 	// Run configures the API server and make the HTTP handler available
 	Run(ctx context.Context) error
+	// Registered returns a channel that will be close once the registration requests are received from the kube-apiserver.
+	Registered() <-chan struct{}
 }
 
 type Server struct {
@@ -61,7 +63,8 @@ type Server struct {
 
 	cacheFactory *factory.CacheFactory
 
-	extensionAPIServer ExtensionAPIServer
+	extensionAPIServer            ExtensionAPIServer
+	SkipWaitForExtensionAPIServer bool
 
 	authMiddleware      auth.Middleware
 	controllers         *Controllers
@@ -98,6 +101,9 @@ type Options struct {
 	// In most cases, you'll want to use [github.com/rancher/steve/pkg/ext.NewExtensionAPIServer]
 	// to create an ExtensionAPIServer.
 	ExtensionAPIServer ExtensionAPIServer
+
+	// SkipWaitForExtensionAPIServer allows serving requests despite the ExtensionAPIServer may not have been registered yet.
+	SkipWaitForExtensionAPIServer bool
 }
 
 func New(ctx context.Context, restConfig *rest.Config, opts *Options) (*Server, error) {
@@ -127,9 +133,10 @@ func New(ctx context.Context, restConfig *rest.Config, opts *Options) (*Server, 
 		ClusterRegistry:            opts.ClusterRegistry,
 		Version:                    opts.ServerVersion,
 		// SQLCache enables the SQLite-based lasso caching mechanism
-		SQLCache:           opts.SQLCache,
-		cacheFactory:       cacheFactory,
-		extensionAPIServer: opts.ExtensionAPIServer,
+		SQLCache:                      opts.SQLCache,
+		cacheFactory:                  cacheFactory,
+		extensionAPIServer:            opts.ExtensionAPIServer,
+		SkipWaitForExtensionAPIServer: opts.SkipWaitForExtensionAPIServer,
 	}
 
 	if err := setup(ctx, server); err != nil {
@@ -222,7 +229,7 @@ func setup(ctx context.Context, server *Server) error {
 		store := metricsStore.NewMetricsStore(errStore)
 		// end store setup code
 
-		for _, template := range resources.DefaultSchemaTemplatesForStore(store, server.BaseSchemas, summaryCache, asl, server.controllers.K8s.Discovery()) {
+		for _, template := range resources.DefaultSchemaTemplatesForStore(store, server.BaseSchemas, summaryCache, asl, server.controllers.K8s.Discovery(), common.TemplateOptions{InSQLMode: true}) {
 			sf.AddTemplate(template)
 		}
 
@@ -236,7 +243,7 @@ func setup(ctx context.Context, server *Server) error {
 			return nil
 		}
 	} else {
-		for _, template := range resources.DefaultSchemaTemplates(cf, server.BaseSchemas, summaryCache, asl, server.controllers.K8s.Discovery(), server.controllers.Core.Namespace().Cache()) {
+		for _, template := range resources.DefaultSchemaTemplates(cf, server.BaseSchemas, summaryCache, asl, server.controllers.K8s.Discovery(), server.controllers.Core.Namespace().Cache(), common.TemplateOptions{InSQLMode: false}) {
 			sf.AddTemplate(template)
 		}
 		onSchemasHandler = ccache.OnSchemas
@@ -253,7 +260,21 @@ func setup(ctx context.Context, server *Server) error {
 		onSchemasHandler,
 		sf)
 
-	apiServer, handler, err := handler.New(server.RESTConfig, sf, server.authMiddleware, server.next, server.router, server.extensionAPIServer)
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if server.extensionAPIServer == nil || server.SkipWaitForExtensionAPIServer {
+			server.next.ServeHTTP(rw, req)
+			return
+		}
+
+		select {
+		case <-server.extensionAPIServer.Registered():
+			server.next.ServeHTTP(rw, req)
+		default:
+			http.Error(rw, "API Aggregation not ready", http.StatusServiceUnavailable)
+		}
+	})
+
+	apiServer, handler, err := handler.New(server.RESTConfig, sf, server.authMiddleware, next, server.router, server.extensionAPIServer)
 	if err != nil {
 		return err
 	}

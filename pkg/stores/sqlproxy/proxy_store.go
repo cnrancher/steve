@@ -65,8 +65,6 @@ var (
 	paramCodec  = runtime.NewParameterCodec(paramScheme)
 	// Please keep the gvkKey entries in alphabetical order, on a field-by-field basis
 	typeSpecificIndexedFields = map[string][][]string{
-		gvkKey("", "v1", "ConfigMap"): {
-			{"metadata", "labels", "harvesterhci.io/cloud-init-template"}},
 		gvkKey("", "v1", "Event"): {
 			{"_type"},
 			{"involvedObject", "kind"},
@@ -75,7 +73,8 @@ var (
 			{"reason"},
 		},
 		gvkKey("", "v1", "Namespace"): {
-			{"metadata", "labels", "field.cattle.io/projectId"}},
+			{"spec", "displayName"},
+		},
 		gvkKey("", "v1", "Node"): {
 			{"status", "nodeInfo", "kubeletVersion"},
 			{"status", "nodeInfo", "operatingSystem"}},
@@ -90,6 +89,9 @@ var (
 			{"spec", "nodeName"}},
 		gvkKey("", "v1", "ReplicationController"): {
 			{"spec", "template", "spec", "containers", "image"}},
+		gvkKey("", "v1", "Secret"): {
+			{"metadata", "annotations", "management.cattle.io/project-scoped-secret-copy"},
+		},
 		gvkKey("", "v1", "Service"): {
 			{"spec", "clusterIP"},
 			{"spec", "type"},
@@ -141,11 +143,19 @@ var (
 		gvkKey("cluster.x-k8s.io", "v1beta1", "MachineDeployment"): {
 			{"spec", "clusterName"}},
 		gvkKey("management.cattle.io", "v3", "Cluster"): {
-			{"metadata", "labels", "provider.cattle.io"},
 			{"spec", "internal"},
 			{"spec", "displayName"},
 			{"status", "connected"},
 			{"status", "provider"},
+		},
+		gvkKey("management.cattle.io", "v3", "ClusterRoleTemplateBinding"): {
+			{"clusterName"},
+			{"userName"},
+			{"userPrincipalName"},
+		},
+		gvkKey("management.cattle.io", "v3", "GlobalRoleBinding"): {
+			{"userName"},
+			{"userPrincipalName"},
 		},
 		gvkKey("management.cattle.io", "v3", "Node"): {
 			{"status", "nodeName"}},
@@ -154,14 +164,22 @@ var (
 		gvkKey("management.cattle.io", "v3", "NodeTemplate"): {
 			{"spec", "clusterName"}},
 		gvkKey("management.cattle.io", "v3", "Project"): {
-			{"spec", "clusterName"}},
+			{"spec", "clusterName"},
+			{"spec", "displayName"},
+		},
+		gvkKey("management.cattle.io", "v3", "ProjectRoleTemplateBinding"): {
+			{"userName"},
+			{"userPrincipalName"},
+		},
+		gvkKey("management.cattle.io", "v3", "RoleTemplate"): {
+			{"context"},
+		},
 		gvkKey("networking.k8s.io", "v1", "Ingress"): {
 			{"spec", "rules", "host"},
 			{"spec", "ingressClassName"},
 		},
 		gvkKey("provisioning.cattle.io", "v1", "Cluster"): {
 			{"metadata", "annotations", "provisioning.cattle.io/management-cluster-display-name"},
-			{"metadata", "labels", "provider.cattle.io"},
 			{"status", "clusterName"},
 			{"status", "provider"},
 		},
@@ -187,6 +205,26 @@ var (
 				"resource": "namespaces",
 			},
 		},
+	}
+	namespaceGVK             = schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Namespace"}
+	mcioProjectGvk           = schema.GroupVersionKind{Group: "management.cattle.io", Version: "v3", Kind: "Project"}
+	namespaceProjectLabelDep = sqltypes.ExternalLabelDependency{
+		SourceGVK:            gvkKey("", "v1", "Namespace"),
+		SourceLabelName:      "field.cattle.io/projectId",
+		TargetGVK:            gvkKey("management.cattle.io", "v3", "Project"),
+		TargetKeyFieldName:   "metadata.name",
+		TargetFinalFieldName: "spec.displayName",
+	}
+	namespaceUpdates = sqltypes.ExternalGVKUpdates{
+		AffectedGVK:               namespaceGVK,
+		ExternalDependencies:      nil,
+		ExternalLabelDependencies: []sqltypes.ExternalLabelDependency{namespaceProjectLabelDep},
+	}
+	externalGVKDependencies = sqltypes.ExternalGVKDependency{
+		mcioProjectGvk: &namespaceUpdates,
+	}
+	selfGVKDependencies = sqltypes.ExternalGVKDependency{
+		namespaceGVK: &namespaceUpdates,
 	}
 )
 
@@ -240,7 +278,7 @@ type RelationshipNotifier interface {
 }
 
 type TransformBuilder interface {
-	GetTransformFunc(gvk schema.GroupVersionKind) cache.TransformFunc
+	GetTransformFunc(gvk schema.GroupVersionKind, colDefs []common.ColumnDefinition, isCRD bool) cache.TransformFunc
 }
 
 type Store struct {
@@ -260,7 +298,7 @@ type Store struct {
 type CacheFactoryInitializer func() (CacheFactory, error)
 
 type CacheFactory interface {
-	CacheFor(ctx context.Context, fields [][]string, transform cache.TransformFunc, client dynamic.ResourceInterface, gvk schema.GroupVersionKind, namespaced bool, watchable bool) (factory.Cache, error)
+	CacheFor(ctx context.Context, fields [][]string, externalUpdateInfo *sqltypes.ExternalGVKUpdates, selfUpdateInfo *sqltypes.ExternalGVKUpdates, transform cache.TransformFunc, client dynamic.ResourceInterface, gvk schema.GroupVersionKind, namespaced bool, watchable bool) (factory.Cache, error)
 	Reset() error
 }
 
@@ -295,7 +333,7 @@ func (s *Store) Reset() error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	if err := s.cacheFactory.Reset(); err != nil {
-		return err
+		return fmt.Errorf("reset: %w", err)
 	}
 
 	if err := s.initializeNamespaceCache(); err != nil {
@@ -335,14 +373,14 @@ func (s *Store) initializeNamespaceCache() error {
 
 	// get any type-specific fields that steve is interested in
 	fields = append(fields, getFieldForGVK(gvk)...)
+	cols := common.GetColumnDefinitions(&nsSchema)
 
 	// get the type-specific transform func
-	transformFunc := s.transformBuilder.GetTransformFunc(gvk)
+	transformFunc := s.transformBuilder.GetTransformFunc(gvk, cols, attributes.IsCRD(&nsSchema))
 
 	// get the ns informer
 	tableClient := &tablelistconvert.Client{ResourceInterface: client}
-	attrs := attributes.GVK(&nsSchema)
-	nsInformer, err := s.cacheFactory.CacheFor(s.ctx, fields, transformFunc, tableClient, attrs, false, true)
+	nsInformer, err := s.cacheFactory.CacheFor(s.ctx, fields, externalGVKDependencies[gvk], selfGVKDependencies[gvk], transformFunc, tableClient, gvk, false, true)
 	if err != nil {
 		return err
 	}
@@ -545,11 +583,11 @@ func (s *Store) watch(apiOp *types.APIRequest, schema *types.APISchema, w types.
 	gvk := attributes.GVK(schema)
 	fields := getFieldsFromSchema(schema)
 	fields = append(fields, getFieldForGVK(gvk)...)
-	transformFunc := s.transformBuilder.GetTransformFunc(gvk)
+	cols := common.GetColumnDefinitions(schema)
+	transformFunc := s.transformBuilder.GetTransformFunc(gvk, cols, attributes.IsCRD(schema))
 	tableClient := &tablelistconvert.Client{ResourceInterface: client}
-	attrs := attributes.GVK(schema)
 	ns := attributes.Namespaced(schema)
-	inf, err := s.cacheFactory.CacheFor(s.ctx, fields, transformFunc, tableClient, attrs, ns, controllerschema.IsListWatchable(schema))
+	inf, err := s.cacheFactory.CacheFor(s.ctx, fields, externalGVKDependencies[gvk], selfGVKDependencies[gvk], transformFunc, tableClient, gvk, ns, controllerschema.IsListWatchable(schema))
 	if err != nil {
 		return nil, err
 	}
@@ -743,10 +781,6 @@ func (s *Store) Delete(apiOp *types.APIRequest, schema *types.APISchema, id stri
 //   - a continue token, if there are more pages after the returned one
 //   - an error instead of all of the above if anything went wrong
 func (s *Store) ListByPartitions(apiOp *types.APIRequest, apiSchema *types.APISchema, partitions []partition.Partition) (*unstructured.UnstructuredList, int, string, error) {
-	opts, err := listprocessor.ParseQuery(apiOp, s.namespaceCache)
-	if err != nil {
-		return nil, 0, "", err
-	}
 	// warnings from inside the informer are discarded
 	buffer := WarningBuffer{}
 	client, err := s.clientGetter.TableAdminClient(apiOp, apiSchema, "", &buffer)
@@ -756,14 +790,32 @@ func (s *Store) ListByPartitions(apiOp *types.APIRequest, apiSchema *types.APISc
 	gvk := attributes.GVK(apiSchema)
 	fields := getFieldsFromSchema(apiSchema)
 	fields = append(fields, getFieldForGVK(gvk)...)
-	transformFunc := s.transformBuilder.GetTransformFunc(gvk)
+	cols := common.GetColumnDefinitions(apiSchema)
+
+	transformFunc := s.transformBuilder.GetTransformFunc(gvk, cols, attributes.IsCRD(apiSchema))
 	tableClient := &tablelistconvert.Client{ResourceInterface: client}
-	attrs := attributes.GVK(apiSchema)
 	ns := attributes.Namespaced(apiSchema)
-	inf, err := s.cacheFactory.CacheFor(s.ctx, fields, transformFunc, tableClient, attrs, ns, controllerschema.IsListWatchable(apiSchema))
+	inf, err := s.cacheFactory.CacheFor(s.ctx, fields, externalGVKDependencies[gvk], selfGVKDependencies[gvk], transformFunc, tableClient, gvk, ns, controllerschema.IsListWatchable(apiSchema))
 	if err != nil {
+		return nil, 0, "", fmt.Errorf("cachefor %v: %w", gvk, err)
+	}
+
+	opts, err := listprocessor.ParseQuery(apiOp, s.namespaceCache)
+	if err != nil {
+		var apiError *apierror.APIError
+		if errors.As(err, &apiError) {
+			if apiError.Code.Status == http.StatusNoContent {
+				list := &unstructured.UnstructuredList{}
+				resourceVersion := inf.ByOptionsLister.GetLatestResourceVersion()
+				if len(resourceVersion) > 0 {
+					list.SetResourceVersion(resourceVersion[0])
+				}
+				return list, 0, "", nil
+			}
+		}
 		return nil, 0, "", err
 	}
+
 	if gvk.Group == "ext.cattle.io" && (gvk.Kind == "Token" || gvk.Kind == "Kubeconfig") {
 		accessSet := accesscontrol.AccessSetFromAPIRequest(apiOp)
 		// See https://github.com/rancher/rancher/blob/7266e5e624f0d610c76ab0af33e30f5b72e11f61/pkg/ext/stores/tokens/tokens.go#L1186C2-L1195C3
@@ -792,7 +844,7 @@ func (s *Store) ListByPartitions(apiOp *types.APIRequest, apiSchema *types.APISc
 		if errors.Is(err, informer.ErrInvalidColumn) {
 			return nil, 0, "", apierror.NewAPIError(validation.InvalidBodyContent, err.Error())
 		}
-		return nil, 0, "", err
+		return nil, 0, "", fmt.Errorf("listbyoptions %v: %w", gvk, err)
 	}
 
 	return list, total, continueToken, nil

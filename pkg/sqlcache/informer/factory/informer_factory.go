@@ -14,6 +14,7 @@ import (
 	"github.com/rancher/steve/pkg/sqlcache/db"
 	"github.com/rancher/steve/pkg/sqlcache/encryption"
 	"github.com/rancher/steve/pkg/sqlcache/informer"
+	"github.com/rancher/steve/pkg/sqlcache/sqltypes"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -27,14 +28,18 @@ const EncryptAllEnvVar = "CATTLE_ENCRYPT_CACHE_ALL"
 
 // CacheFactory builds Informer instances and keeps a cache of instances it created
 type CacheFactory struct {
-	wg         wait.Group
-	dbClient   db.Client
-	stopCh     chan struct{}
+	wg       wait.Group
+	dbClient db.Client
+
+	// ctx determines when informers need to stop
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	mutex      sync.RWMutex
 	encryptAll bool
 
-	defaultMaximumEventsCount int
-	perGVKMaximumEventsCount  map[schema.GroupVersionKind]int
+	gcInterval  time.Duration
+	gcKeepCount int
 
 	newInformer newInformer
 
@@ -47,7 +52,7 @@ type guardedInformer struct {
 	mutex    *sync.Mutex
 }
 
-type newInformer func(ctx context.Context, client dynamic.ResourceInterface, fields [][]string, transform cache.TransformFunc, gvk schema.GroupVersionKind, db db.Client, shouldEncrypt bool, namespace bool, watchable bool, maxEventsCount int) (*informer.Informer, error)
+type newInformer func(ctx context.Context, client dynamic.ResourceInterface, fields [][]string, externalUpdateInfo *sqltypes.ExternalGVKUpdates, selfUpdateInfo *sqltypes.ExternalGVKUpdates, transform cache.TransformFunc, gvk schema.GroupVersionKind, db db.Client, shouldEncrypt bool, namespace bool, watchable bool, gcInterval time.Duration, gcKeepCount int) (*informer.Informer, error)
 
 type Cache struct {
 	informer.ByOptionsLister
@@ -66,19 +71,10 @@ var defaultEncryptedResourceTypes = map[schema.GroupVersionKind]struct{}{
 }
 
 type CacheFactoryOptions struct {
-	// DefaultMaximumEventsCount is the maximum number of events to keep in
-	// the events table by default.
-	//
-	// Use PerGVKMaximumEventsCount if you want to set a different value for
-	// a specific GVK.
-	//
-	// A value of 0 means no limits.
-	DefaultMaximumEventsCount int
-	// PerGVKMaximumEventsCount is the maximum number of events to keep in
-	// the events table for specific GVKs.
-	//
-	// A value of 0 means no limits.
-	PerGVKMaximumEventsCount map[schema.GroupVersionKind]int
+	// GCInterval is how often to run the garbage collection
+	GCInterval time.Duration
+	// GCKeepCount is how many events to keep in _events table when gc runs
+	GCKeepCount int
 }
 
 // NewCacheFactory returns an informer factory instance
@@ -88,18 +84,22 @@ func NewCacheFactory(opts CacheFactoryOptions) (*CacheFactory, error) {
 	if err != nil {
 		return nil, err
 	}
-	dbClient, err := db.NewClient(nil, m, m)
+	dbClient, _, err := db.NewClient(nil, m, m, false)
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &CacheFactory{
-		wg:         wait.Group{},
-		stopCh:     make(chan struct{}),
+		wg: wait.Group{},
+
+		ctx:    ctx,
+		cancel: cancel,
+
 		encryptAll: os.Getenv(EncryptAllEnvVar) == "true",
 		dbClient:   dbClient,
 
-		defaultMaximumEventsCount: opts.DefaultMaximumEventsCount,
-		perGVKMaximumEventsCount:  opts.PerGVKMaximumEventsCount,
+		gcInterval:  opts.GCInterval,
+		gcKeepCount: opts.GCKeepCount,
 
 		newInformer: informer.NewInformer,
 		informers:   map[schema.GroupVersionKind]*guardedInformer{},
@@ -108,7 +108,7 @@ func NewCacheFactory(opts CacheFactoryOptions) (*CacheFactory, error) {
 
 // CacheFor returns an informer for given GVK, using sql store indexed with fields, using the specified client. For virtual fields, they must be added by the transform function
 // and specified by fields to be used for later fields.
-func (f *CacheFactory) CacheFor(ctx context.Context, fields [][]string, transform cache.TransformFunc, client dynamic.ResourceInterface, gvk schema.GroupVersionKind, namespaced bool, watchable bool) (Cache, error) {
+func (f *CacheFactory) CacheFor(ctx context.Context, fields [][]string, externalUpdateInfo *sqltypes.ExternalGVKUpdates, selfUpdateInfo *sqltypes.ExternalGVKUpdates, transform cache.TransformFunc, client dynamic.ResourceInterface, gvk schema.GroupVersionKind, namespaced bool, watchable bool) (Cache, error) {
 	// First of all block Reset() until we are done
 	f.mutex.RLock()
 	defer f.mutex.RUnlock()
@@ -137,15 +137,14 @@ func (f *CacheFactory) CacheFor(ctx context.Context, fields [][]string, transfor
 	// actually create the informer
 	if gi.informer == nil {
 		start := time.Now()
-		log.Debugf("CacheFor STARTS creating informer for %v", gvk)
+		log.Infof("CacheFor STARTS creating informer for %v", gvk)
 		defer func() {
-			log.Debugf("CacheFor IS DONE creating informer for %v (took %v)", gvk, time.Now().Sub(start))
+			log.Infof("CacheFor IS DONE creating informer for %v (took %v)", gvk, time.Now().Sub(start))
 		}()
 
 		_, encryptResourceAlways := defaultEncryptedResourceTypes[gvk]
 		shouldEncrypt := f.encryptAll || encryptResourceAlways
-		maxEventsCount := f.getMaximumEventsCount(gvk)
-		i, err := f.newInformer(ctx, client, fields, transform, gvk, f.dbClient, shouldEncrypt, namespaced, watchable, maxEventsCount)
+		i, err := f.newInformer(f.ctx, client, fields, externalUpdateInfo, selfUpdateInfo, transform, gvk, f.dbClient, shouldEncrypt, namespaced, watchable, f.gcInterval, f.gcKeepCount)
 		if err != nil {
 			return Cache{}, err
 		}
@@ -155,18 +154,18 @@ func (f *CacheFactory) CacheFor(ctx context.Context, fields [][]string, transfor
 				// expected, continue without logging
 				return
 			}
-			cache.DefaultWatchErrorHandler(r, err)
+			cache.DefaultWatchErrorHandler(ctx, r, err)
 		})
 		if err != nil {
 			return Cache{}, err
 		}
 
-		f.wg.StartWithChannel(f.stopCh, i.Run)
+		f.wg.StartWithChannel(f.ctx.Done(), i.Run)
 
 		gi.informer = i
 	}
 
-	if !cache.WaitForCacheSync(f.stopCh, gi.informer.HasSynced) {
+	if !cache.WaitForCacheSync(f.ctx.Done(), gi.informer.HasSynced) {
 		return Cache{}, fmt.Errorf("failed to sync SQLite Informer cache for GVK %v", gvk)
 	}
 
@@ -174,14 +173,7 @@ func (f *CacheFactory) CacheFor(ctx context.Context, fields [][]string, transfor
 	return Cache{ByOptionsLister: gi.informer}, nil
 }
 
-func (f *CacheFactory) getMaximumEventsCount(gvk schema.GroupVersionKind) int {
-	if maxCount, ok := f.perGVKMaximumEventsCount[gvk]; ok {
-		return maxCount
-	}
-	return f.defaultMaximumEventsCount
-}
-
-// Reset closes the stopCh which stops any running informers, assigns a new stopCh, resets the GVK-informer cache, and resets
+// Reset cancels ctx which stops any running informers, assigns a new ctx, resets the GVK-informer cache, and resets
 // the database connection which wipes any current sqlite database at the default location.
 func (f *CacheFactory) Reset() error {
 	if f.dbClient == nil {
@@ -194,8 +186,8 @@ func (f *CacheFactory) Reset() error {
 	defer f.mutex.Unlock()
 
 	// now that we are alone, stop all informers created until this point
-	close(f.stopCh)
-	f.stopCh = make(chan struct{})
+	f.cancel()
+	f.ctx, f.cancel = context.WithCancel(context.Background())
 	f.wg.Wait()
 
 	// and get rid of all references to those informers and their mutexes
@@ -204,7 +196,7 @@ func (f *CacheFactory) Reset() error {
 	f.informers = make(map[schema.GroupVersionKind]*guardedInformer)
 
 	// finally, reset the DB connection
-	err := f.dbClient.NewConnection()
+	_, err := f.dbClient.NewConnection(false)
 	if err != nil {
 		return err
 	}

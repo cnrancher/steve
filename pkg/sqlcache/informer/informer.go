@@ -48,6 +48,7 @@ type WatchFilter struct {
 type ByOptionsLister interface {
 	ListByOptions(ctx context.Context, lo *sqltypes.ListOptions, partitions []partition.Partition, namespace string) (*unstructured.UnstructuredList, int, string, error)
 	Watch(ctx context.Context, options WatchOptions, eventsCh chan<- watch.Event) error
+	GetLatestResourceVersion() []string
 }
 
 // this is set to a var so that it can be overridden by test code for mocking purposes
@@ -55,7 +56,7 @@ var newInformer = cache.NewSharedIndexInformer
 
 // NewInformer returns a new SQLite-backed Informer for the type specified by schema in unstructured.Unstructured form
 // using the specified client
-func NewInformer(ctx context.Context, client dynamic.ResourceInterface, fields [][]string, transform cache.TransformFunc, gvk schema.GroupVersionKind, db db.Client, shouldEncrypt bool, namespaced bool, watchable bool, maxEventsCount int) (*Informer, error) {
+func NewInformer(ctx context.Context, client dynamic.ResourceInterface, fields [][]string, externalUpdateInfo *sqltypes.ExternalGVKUpdates, selfUpdateInfo *sqltypes.ExternalGVKUpdates, transform cache.TransformFunc, gvk schema.GroupVersionKind, db db.Client, shouldEncrypt bool, namespaced bool, watchable bool, gcInterval time.Duration, gcKeepCount int) (*Informer, error) {
 	watchFunc := func(options metav1.ListOptions) (watch.Interface, error) {
 		return client.Watch(ctx, options)
 	}
@@ -68,6 +69,9 @@ func NewInformer(ctx context.Context, client dynamic.ResourceInterface, fields [
 	listWatcher := &cache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 			a, err := client.List(ctx, options)
+			if err != nil {
+				return nil, err
+			}
 			// We want the list to be consistent when there are going to be relists
 			sort.SliceStable(a.Items, func(i int, j int) bool {
 				var err error
@@ -109,15 +113,16 @@ func NewInformer(ctx context.Context, client dynamic.ResourceInterface, fields [
 
 	name := informerNameFromGVK(gvk)
 
-	s, err := sqlStore.NewStore(ctx, example, cache.DeletionHandlingMetaNamespaceKeyFunc, db, shouldEncrypt, name)
+	s, err := sqlStore.NewStore(ctx, example, cache.DeletionHandlingMetaNamespaceKeyFunc, db, shouldEncrypt, gvk, name, externalUpdateInfo, selfUpdateInfo)
 	if err != nil {
 		return nil, err
 	}
 
 	opts := ListOptionIndexerOptions{
-		Fields:             fields,
-		IsNamespaced:       namespaced,
-		MaximumEventsCount: maxEventsCount,
+		Fields:       fields,
+		IsNamespaced: namespaced,
+		GCInterval:   gcInterval,
+		GCKeepCount:  gcKeepCount,
 	}
 	loi, err := NewListOptionIndexer(ctx, s, opts)
 	if err != nil {

@@ -1,5 +1,5 @@
 # syntax = docker/dockerfile:experimental
-FROM registry.suse.com/bci/golang:1.23 as build
+FROM registry.suse.com/bci/golang:1.24 as build
 COPY go.mod go.sum main.go /src/
 COPY pkg /src/pkg/
 #RUN --mount=type=cache,target=/root/.cache/go-build \
@@ -7,7 +7,7 @@ RUN \
     cd /src && \
     CGO_ENABLED=0 go build -ldflags "-extldflags -static -s" -o /steve
 
-FROM registry.suse.com/bci/bci-micro:15.6
+FROM registry.suse.com/bci/bci-micro:15.7
 
 ARG user=steve
 

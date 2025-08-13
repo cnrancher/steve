@@ -8,11 +8,14 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/gob"
 	"fmt"
 	"io/fs"
 	"os"
 	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 
 	"errors"
@@ -21,11 +24,15 @@ import (
 
 	// needed for drivers
 	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 const (
 	// InformerObjectCacheDBPath is where SQLite's object database file will be stored relative to process running steve
-	InformerObjectCacheDBPath = "informer_object_cache.db"
+	// It's given in two parts because the root is used as the suffix for the tempfile, and then we'll add a ".db" after it.
+	// In non-test mode, we can append the ".db" extension right here.
+	InformerObjectCacheDBPathRoot = "informer_object_cache"
+	InformerObjectCacheDBPath     = InformerObjectCacheDBPathRoot + ".db"
 
 	informerObjectCachePerms fs.FileMode = 0o600
 )
@@ -37,10 +44,13 @@ type Client interface {
 	QueryForRows(ctx context.Context, stmt transaction.Stmt, params ...any) (*sql.Rows, error)
 	ReadObjects(rows Rows, typ reflect.Type, shouldDecrypt bool) ([]any, error)
 	ReadStrings(rows Rows) ([]string, error)
+	ReadStrings2(rows Rows) ([][]string, error)
 	ReadInt(rows Rows) (int, error)
 	Upsert(tx transaction.Client, stmt *sql.Stmt, key string, obj any, shouldEncrypt bool) error
 	CloseStmt(closable Closable) error
-	NewConnection() error
+	NewConnection(isTemp bool) (string, error)
+	Encryptor() Encryptor
+	Decryptor() Decryptor
 }
 
 // WithTransaction runs f within a transaction.
@@ -55,6 +65,13 @@ type Client interface {
 //
 // The transaction is committed if f returns nil, otherwise it is rolled back.
 func (c *client) WithTransaction(ctx context.Context, forWriting bool, f WithTransactionFunction) error {
+	if err := c.withTransaction(ctx, forWriting, f); err != nil {
+		return fmt.Errorf("transaction: %w", err)
+	}
+	return nil
+}
+
+func (c *client) withTransaction(ctx context.Context, forWriting bool, f WithTransactionFunction) error {
 	c.connLock.RLock()
 	// note: this assumes _txlock=immediate in the connection string, see NewConnection
 	tx, err := c.conn.BeginTx(ctx, &sql.TxOptions{
@@ -62,7 +79,7 @@ func (c *client) WithTransaction(ctx context.Context, forWriting bool, f WithTra
 	})
 	c.connLock.RUnlock()
 	if err != nil {
-		return err
+		return fmt.Errorf("begin tx: %w", err)
 	}
 
 	if err = f(transaction.NewClient(tx)); err != nil {
@@ -155,22 +172,22 @@ type Decryptor interface {
 	Decrypt([]byte, []byte, uint32) ([]byte, error)
 }
 
-// NewClient returns a client. If the given connection is nil then a default one will be created.
-func NewClient(c Connection, encryptor Encryptor, decryptor Decryptor) (Client, error) {
+// NewClient returns a client and the path to the database. If the given connection is nil then a default one will be created.
+func NewClient(c Connection, encryptor Encryptor, decryptor Decryptor, useTempDir bool) (Client, string, error) {
 	client := &client{
 		encryptor: encryptor,
 		decryptor: decryptor,
 	}
 	if c != nil {
 		client.conn = c
-		return client, nil
+		return client, "", nil
 	}
-	err := client.NewConnection()
+	dbPath, err := client.NewConnection(useTempDir)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	return client, nil
+	return client, dbPath, nil
 }
 
 // Prepare prepares the given string into a sql statement on the client's connection.
@@ -258,6 +275,34 @@ func (c *client) ReadStrings(rows Rows) ([]string, error) {
 	return result, nil
 }
 
+// ReadStrings2 scans the given rows into pairs of strings, and then returns the strings as a slice.
+func (c *client) ReadStrings2(rows Rows) ([][]string, error) {
+	c.connLock.RLock()
+	defer c.connLock.RUnlock()
+
+	var result [][]string
+	for rows.Next() {
+		var key1, key2 string
+		err := rows.Scan(&key1, &key2)
+		if err != nil {
+			return nil, closeRowsOnError(rows, err)
+		}
+
+		result = append(result, []string{key1, key2})
+	}
+	err := rows.Err()
+	if err != nil {
+		return nil, closeRowsOnError(rows, err)
+	}
+
+	err = rows.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
 // ReadInt scans the first of the given rows into a single int (eg. for COUNT() queries)
 func (c *client) ReadInt(rows Rows) (int, error) {
 	c.connLock.RLock()
@@ -321,6 +366,14 @@ func (c *client) Upsert(tx transaction.Client, stmt *sql.Stmt, key string, obj a
 	return err
 }
 
+func (c *client) Encryptor() Encryptor {
+	return c.encryptor
+}
+
+func (c *client) Decryptor() Decryptor {
+	return c.decryptor
+}
+
 // toBytes encodes an object to a byte slice
 func toBytes(obj any) []byte {
 	var buf bytes.Buffer
@@ -353,27 +406,43 @@ func closeRowsOnError(rows Rows, err error) error {
 
 // NewConnection checks for currently existing connection, closes one if it exists, removes any relevant db files, and opens a new connection which subsequently
 // creates new files.
-func (c *client) NewConnection() error {
+func (c *client) NewConnection(useTempDir bool) (string, error) {
 	c.connLock.Lock()
 	defer c.connLock.Unlock()
 	if c.conn != nil {
 		err := c.conn.Close()
 		if err != nil {
-			return err
+			return "", err
 		}
 	}
-	err := os.RemoveAll(InformerObjectCacheDBPath)
-	if err != nil {
-		return err
+	if !useTempDir {
+		err := os.RemoveAll(InformerObjectCacheDBPath)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	// Set the permissions in advance, because we can't control them if
 	// the file is created by a sql.Open call instead.
-	if err := touchFile(InformerObjectCacheDBPath, informerObjectCachePerms); err != nil {
-		return nil
+	var dbPath string
+	if useTempDir {
+		dir := os.TempDir()
+		f, err := os.CreateTemp(dir, InformerObjectCacheDBPathRoot)
+		if err != nil {
+			return "", err
+		}
+		path := f.Name()
+		dbPath = path + ".db"
+		f.Close()
+		os.Remove(path)
+	} else {
+		dbPath = InformerObjectCacheDBPath
+	}
+	if err := touchFile(dbPath, informerObjectCachePerms); err != nil {
+		return dbPath, nil
 	}
 
-	sqlDB, err := sql.Open("sqlite", "file:"+InformerObjectCacheDBPath+"?"+
+	sqlDB, err := sql.Open("sqlite", "file:"+dbPath+"?"+
 		// open SQLite file in read-write mode, creating it if it does not exist
 		"mode=rwc&"+
 		// use the WAL journal mode for consistency and efficiency
@@ -390,11 +459,45 @@ func (c *client) NewConnection() error {
 		// of BeginTx
 		"_txlock=immediate")
 	if err != nil {
-		return err
+		return dbPath, err
 	}
-
+	sqlite.RegisterDeterministicScalarFunction(
+		"extractBarredValue",
+		2,
+		func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			var arg1 string
+			var arg2 int
+			switch argTyped := args[0].(type) {
+			case string:
+				arg1 = argTyped
+			case []byte:
+				arg1 = string(argTyped)
+			default:
+				return nil, fmt.Errorf("unsupported type for arg1: expected a string, got :%T", args[0])
+			}
+			var err error
+			switch argTyped := args[1].(type) {
+			case int:
+				arg2 = argTyped
+			case string:
+				arg2, err = strconv.Atoi(argTyped)
+			case []byte:
+				arg2, err = strconv.Atoi(string(argTyped))
+			default:
+				return nil, fmt.Errorf("unsupported type for arg2: expected an int, got: %T", args[0])
+			}
+			if err != nil {
+				return nil, fmt.Errorf("problem with arg2: %w", err)
+			}
+			parts := strings.Split(arg1, "|")
+			if arg2 >= len(parts) || arg2 < 0 {
+				return "", nil
+			}
+			return parts[arg2], nil
+		},
+	)
 	c.conn = sqlDB
-	return nil
+	return dbPath, nil
 }
 
 // This acts like "touch" for both existing files and non-existing files.
