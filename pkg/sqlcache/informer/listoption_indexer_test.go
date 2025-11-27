@@ -8,10 +8,11 @@ package informer
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -23,42 +24,81 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
-	watch "k8s.io/apimachinery/pkg/watch"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 )
 
-func makeListOptionIndexer(ctx context.Context, opts ListOptionIndexerOptions, shouldEncrypt bool) (*ListOptionIndexer, string, error) {
-	gvk := schema.GroupVersionKind{
-		Group:   "",
-		Version: "v1",
-		Kind:    "ConfigMap",
-	}
-	example := &unstructured.Unstructured{}
-	example.SetGroupVersionKind(gvk)
-	name := informerNameFromGVK(gvk)
+var emptyNamespaceList = &unstructured.UnstructuredList{Object: map[string]any{"items": []any{}}, Items: []unstructured.Unstructured{}}
+
+func makeListOptionIndexer(ctx context.Context, gvk schema.GroupVersionKind, opts ListOptionIndexerOptions, shouldEncrypt bool, nsList *unstructured.UnstructuredList) (*ListOptionIndexer, string, error) {
 	m, err := encryption.NewManager()
 	if err != nil {
 		return nil, "", err
 	}
 
-	db, dbPath, err := db.NewClient(nil, m, m, true)
+	db, dbPath, err := db.NewClient(ctx, nil, m, m, true)
+	if err != nil {
+		return nil, "", err
+	}
+	// First create a namespace table so the projectsornamespaces query succeeds
+	nsGVK := schema.GroupVersionKind{
+		Group:   "",
+		Version: "v1",
+		Kind:    "Namespace",
+	}
+	example := &unstructured.Unstructured{}
+	example.SetGroupVersionKind(nsGVK)
+	name := informerNameFromGVK(nsGVK)
+	s, err := store.NewStore(ctx, example, cache.DeletionHandlingMetaNamespaceKeyFunc, db, shouldEncrypt, nsGVK, name, nil, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	ns_opts := ListOptionIndexerOptions{
+		Fields:       [][]string{},
+		IsNamespaced: false,
+	}
+	listOptionIndexer, err := NewListOptionIndexer(ctx, s, ns_opts)
+	if err != nil {
+		return nil, "", err
+	}
+	if nsList != nil {
+		for _, item := range nsList.Items {
+			err = listOptionIndexer.Add(&item)
+			if err != nil {
+				return nil, "", err
+			}
+		}
+	}
+
+	example = &unstructured.Unstructured{}
+	example.SetGroupVersionKind(gvk)
+	name = informerNameFromGVK(gvk)
+
+	s, err = store.NewStore(ctx, example, cache.DeletionHandlingMetaNamespaceKeyFunc, db, shouldEncrypt, gvk, name, nil, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	if opts.IsNamespaced {
+		// Can't use slices.Compare because []string doesn't implement comparable
+		idEntry := []string{"id"}
+		if opts.Fields == nil {
+			opts.Fields = [][]string{idEntry}
+		} else {
+			opts.Fields = append(opts.Fields, idEntry)
+		}
+	}
+
+	listOptionIndexer, err = NewListOptionIndexer(ctx, s, opts)
 	if err != nil {
 		return nil, "", err
 	}
 
-	s, err := store.NewStore(ctx, example, cache.DeletionHandlingMetaNamespaceKeyFunc, db, shouldEncrypt, gvk, name, nil, nil)
-	if err != nil {
-		return nil, "", err
-	}
-
-	listOptionIndexer, err := NewListOptionIndexer(ctx, s, opts)
-	if err != nil {
-		return nil, "", err
-	}
+	go listOptionIndexer.RunGC(ctx)
 
 	return listOptionIndexer, dbPath, nil
 }
@@ -77,11 +117,12 @@ func TestNewListOptionIndexer(t *testing.T) {
 
 	var tests []testCase
 	tests = append(tests, testCase{description: "NewListOptionIndexer() with no errors returned, should return no error", test: func(t *testing.T) {
-		txClient := NewMockTXClient(gomock.NewController(t))
-		store := NewMockStore(gomock.NewController(t))
+		ctrl := gomock.NewController(t)
+		txClient := NewMockTxClient(ctrl)
+		store := NewMockStore(ctrl)
+		stmt := NewMockStmt(ctrl)
 		fields := [][]string{{"something"}}
 		id := "somename"
-		stmt := &sql.Stmt{}
 		// logic for NewIndexer(), only interested in if this results in error or not
 		store.EXPECT().GetName().Return(id).AnyTimes()
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
@@ -100,13 +141,14 @@ func TestNewListOptionIndexer(t *testing.T) {
 
 		store.EXPECT().RegisterAfterAdd(gomock.Any()).Times(3)
 		store.EXPECT().RegisterAfterUpdate(gomock.Any()).Times(3)
-		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(3)
+		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(1)
 		store.EXPECT().RegisterAfterDeleteAll(gomock.Any()).Times(2)
+		store.EXPECT().RegisterBeforeDropAll(gomock.Any()).AnyTimes()
 
 		// create events table
 		txClient.EXPECT().Exec(fmt.Sprintf(createEventsTableFmt, id)).Return(nil, nil)
 		// create field table
-		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
+		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" INT`)).Return(nil, nil)
 		// create field table indexes
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.name", id, "metadata.name")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.namespace", id, "metadata.namespace")).Return(nil, nil)
@@ -124,6 +166,7 @@ func TestNewListOptionIndexer(t *testing.T) {
 
 		opts := ListOptionIndexerOptions{
 			Fields:       fields,
+			TypeGuidance: map[string]string{"something": "INT"},
 			IsNamespaced: true,
 		}
 		loi, err := NewListOptionIndexer(context.Background(), store, opts)
@@ -131,7 +174,7 @@ func TestNewListOptionIndexer(t *testing.T) {
 		assert.NotNil(t, loi)
 	}})
 	tests = append(tests, testCase{description: "NewListOptionIndexer() with error returned from NewIndexer(), should return an error", test: func(t *testing.T) {
-		txClient := NewMockTXClient(gomock.NewController(t))
+		txClient := NewMockTxClient(gomock.NewController(t))
 		store := NewMockStore(gomock.NewController(t))
 		fields := [][]string{{"something"}}
 		id := "somename"
@@ -154,11 +197,12 @@ func TestNewListOptionIndexer(t *testing.T) {
 		assert.NotNil(t, err)
 	}})
 	tests = append(tests, testCase{description: "NewListOptionIndexer() with error returned from Begin(), should return an error", test: func(t *testing.T) {
-		txClient := NewMockTXClient(gomock.NewController(t))
-		store := NewMockStore(gomock.NewController(t))
+		ctrl := gomock.NewController(t)
+		txClient := NewMockTxClient(ctrl)
+		store := NewMockStore(ctrl)
+		stmt := NewMockStmt(ctrl)
 		fields := [][]string{{"something"}}
 		id := "somename"
-		stmt := &sql.Stmt{}
 		// logic for NewIndexer(), only interested in if this results in error or not
 		store.EXPECT().GetName().Return(id).AnyTimes()
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
@@ -177,8 +221,9 @@ func TestNewListOptionIndexer(t *testing.T) {
 
 		store.EXPECT().RegisterAfterAdd(gomock.Any()).Times(3)
 		store.EXPECT().RegisterAfterUpdate(gomock.Any()).Times(3)
-		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(3)
+		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(1)
 		store.EXPECT().RegisterAfterDeleteAll(gomock.Any()).Times(2)
+		store.EXPECT().RegisterBeforeDropAll(gomock.Any()).AnyTimes()
 
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(fmt.Errorf("error"))
 
@@ -189,11 +234,12 @@ func TestNewListOptionIndexer(t *testing.T) {
 		assert.NotNil(t, err)
 	}})
 	tests = append(tests, testCase{description: "NewListOptionIndexer() with error from Exec() when creating fields table, should return an error", test: func(t *testing.T) {
-		txClient := NewMockTXClient(gomock.NewController(t))
-		store := NewMockStore(gomock.NewController(t))
+		ctrl := gomock.NewController(t)
+		txClient := NewMockTxClient(ctrl)
+		store := NewMockStore(ctrl)
+		stmt := NewMockStmt(ctrl)
 		fields := [][]string{{"something"}}
 		id := "somename"
-		stmt := &sql.Stmt{}
 		// logic for NewIndexer(), only interested in if this results in error or not
 		store.EXPECT().GetName().Return(id).AnyTimes()
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
@@ -212,11 +258,12 @@ func TestNewListOptionIndexer(t *testing.T) {
 
 		store.EXPECT().RegisterAfterAdd(gomock.Any()).Times(3)
 		store.EXPECT().RegisterAfterUpdate(gomock.Any()).Times(3)
-		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(3)
+		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(1)
 		store.EXPECT().RegisterAfterDeleteAll(gomock.Any()).Times(2)
+		store.EXPECT().RegisterBeforeDropAll(gomock.Any()).AnyTimes()
 
 		txClient.EXPECT().Exec(fmt.Sprintf(createEventsTableFmt, id)).Return(nil, nil)
-		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
+		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.name", id, "metadata.name")).Return(nil, fmt.Errorf("error"))
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(fmt.Errorf("error")).Do(
 			func(ctx context.Context, shouldEncrypt bool, f db.WithTransactionFunction) {
@@ -234,11 +281,12 @@ func TestNewListOptionIndexer(t *testing.T) {
 		assert.NotNil(t, err)
 	}})
 	tests = append(tests, testCase{description: "NewListOptionIndexer() with error from create-labels, should return an error", test: func(t *testing.T) {
-		txClient := NewMockTXClient(gomock.NewController(t))
-		store := NewMockStore(gomock.NewController(t))
+		ctrl := gomock.NewController(t)
+		txClient := NewMockTxClient(ctrl)
+		store := NewMockStore(ctrl)
+		stmt := NewMockStmt(ctrl)
 		fields := [][]string{{"something"}}
 		id := "somename"
-		stmt := &sql.Stmt{}
 		// logic for NewIndexer(), only interested in if this results in error or not
 		store.EXPECT().GetName().Return(id).AnyTimes()
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
@@ -257,11 +305,12 @@ func TestNewListOptionIndexer(t *testing.T) {
 
 		store.EXPECT().RegisterAfterAdd(gomock.Any()).Times(3)
 		store.EXPECT().RegisterAfterUpdate(gomock.Any()).Times(3)
-		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(3)
+		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(1)
 		store.EXPECT().RegisterAfterDeleteAll(gomock.Any()).Times(2)
+		store.EXPECT().RegisterBeforeDropAll(gomock.Any()).AnyTimes()
 
 		txClient.EXPECT().Exec(fmt.Sprintf(createEventsTableFmt, id)).Return(nil, nil)
-		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
+		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.name", id, "metadata.name")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.namespace", id, "metadata.namespace")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.creationTimestamp", id, "metadata.creationTimestamp")).Return(nil, nil)
@@ -283,11 +332,12 @@ func TestNewListOptionIndexer(t *testing.T) {
 		assert.NotNil(t, err)
 	}})
 	tests = append(tests, testCase{description: "NewListOptionIndexer() with error from Commit(), should return an error", test: func(t *testing.T) {
-		txClient := NewMockTXClient(gomock.NewController(t))
-		store := NewMockStore(gomock.NewController(t))
+		ctrl := gomock.NewController(t)
+		txClient := NewMockTxClient(ctrl)
+		store := NewMockStore(ctrl)
+		stmt := NewMockStmt(ctrl)
 		fields := [][]string{{"something"}}
 		id := "somename"
-		stmt := &sql.Stmt{}
 		// logic for NewIndexer(), only interested in if this results in error or not
 		store.EXPECT().GetName().Return(id).AnyTimes()
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
@@ -306,11 +356,12 @@ func TestNewListOptionIndexer(t *testing.T) {
 
 		store.EXPECT().RegisterAfterAdd(gomock.Any()).Times(3)
 		store.EXPECT().RegisterAfterUpdate(gomock.Any()).Times(3)
-		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(3)
+		store.EXPECT().RegisterAfterDelete(gomock.Any()).Times(1)
 		store.EXPECT().RegisterAfterDeleteAll(gomock.Any()).Times(2)
+		store.EXPECT().RegisterBeforeDropAll(gomock.Any()).AnyTimes()
 
 		txClient.EXPECT().Exec(fmt.Sprintf(createEventsTableFmt, id)).Return(nil, nil)
-		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
+		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.name", id, "metadata.name")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.namespace", id, "metadata.namespace")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.creationTimestamp", id, "metadata.creationTimestamp")).Return(nil, nil)
@@ -365,6 +416,7 @@ func makeList(t *testing.T, objs ...map[string]any) *unstructured.UnstructuredLi
 
 func TestNewListOptionIndexerEasy(t *testing.T) {
 	ctx := context.Background()
+	gvk := corev1.SchemeGroupVersion.WithKind("Pod")
 
 	type testCase struct {
 		description string
@@ -377,16 +429,24 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 		expectedTotal      int
 		expectedContToken  string
 		expectedErr        error
+		latestRV           string
 	}
 	obj01_no_labels := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
 		"metadata": map[string]any{
 			"name":      "obj01_no_labels",
 			"namespace": "ns-a",
 			"somefield": "foo",
 			"sortfield": "400",
 		},
+		"status": map[string]any{
+			"podIP": "99.4.5.6",
+		},
 	}
 	obj02_milk_saddles := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
 		"metadata": map[string]any{
 			"name":      "obj02_milk_saddles",
 			"namespace": "ns-a",
@@ -397,8 +457,13 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 				"horses": "saddles",
 			},
 		},
+		"status": map[string]any{
+			"podIP": "102.1.2.3",
+		},
 	}
 	obj02a_beef_saddles := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
 		"metadata": map[string]any{
 			"name":      "obj02a_beef_saddles",
 			"namespace": "ns-a",
@@ -409,8 +474,13 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 				"horses": "saddles",
 			},
 		},
+		"status": map[string]any{
+			"podIP": "102.99.2.3",
+		},
 	}
 	obj02b_milk_shoes := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
 		"metadata": map[string]any{
 			"name":      "obj02b_milk_shoes",
 			"namespace": "ns-a",
@@ -421,8 +491,13 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 				"horses": "shoes",
 			},
 		},
+		"status": map[string]any{
+			"podIP": "102.103.2.3",
+		},
 	}
 	obj03_saddles := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
 		"metadata": map[string]any{
 			"name":      "obj03_saddles",
 			"namespace": "ns-a",
@@ -433,10 +508,13 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 			},
 		},
 		"status": map[string]any{
+			"podIP":          "77.4.5.6",
 			"someotherfield": "helloworld",
 		},
 	}
 	obj03a_shoes := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
 		"metadata": map[string]any{
 			"name":      "obj03a_shoes",
 			"namespace": "ns-a",
@@ -447,10 +525,13 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 			},
 		},
 		"status": map[string]any{
+			"podIP":          "102.99.99.1",
 			"someotherfield": "helloworld",
 		},
 	}
 	obj04_milk := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
 		"metadata": map[string]any{
 			"name":      "obj04_milk",
 			"namespace": "ns-a",
@@ -460,8 +541,13 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 				"cows": "milk",
 			},
 		},
+		"status": map[string]any{
+			"podIP": "102.99.105.1",
+		},
 	}
 	obj05__guard_lodgepole := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
 		"metadata": map[string]any{
 			"name":      "obj05__guard_lodgepole",
 			"namespace": "ns-b",
@@ -469,6 +555,9 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 			"labels": map[string]any{
 				"guard.cattle.io": "lodgepole",
 			},
+		},
+		"status": map[string]any{
+			"podIP": "203.1.2.3",
 		},
 	}
 	allObjects := []map[string]any{
@@ -481,8 +570,29 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 		obj04_milk,
 		obj05__guard_lodgepole,
 	}
+	ns_a := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Namespace",
+		"metadata": map[string]any{
+			"name": "ns-a",
+			"labels": map[string]any{
+				"guard.cattle.io": "ponderosa",
+			},
+		},
+	}
+	ns_b := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Namespace",
+		"metadata": map[string]any{
+			"name": "ns-b",
+			"labels": map[string]any{
+				"field.cattle.io/projectId": "ns-b",
+			},
+		},
+	}
 
 	itemList := makeList(t, allObjects...)
+	namespaceList := makeList(t, ns_a, ns_b)
 
 	var tests []testCase
 	tests = append(tests, testCase{
@@ -504,6 +614,62 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 		ns:                "",
 		expectedList:      makeList(t),
 		expectedTotal:     0,
+		expectedContToken: "",
+		expectedErr:       nil,
+	})
+	tests = append(tests, testCase{
+		description: "ListByOptions with single object matching many labels with AND",
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
+			{
+				[]sqltypes.Filter{
+					{
+						Field:   []string{"metadata", "labels", "cows"},
+						Matches: []string{"milk"},
+						Op:      sqltypes.Eq,
+					},
+				},
+			},
+			{
+				[]sqltypes.Filter{
+					{
+						Field:   []string{"metadata", "labels", "horses"},
+						Matches: []string{"shoes"},
+						Op:      sqltypes.Eq,
+					},
+				},
+			},
+		},
+		},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, obj02b_milk_shoes),
+		expectedTotal:     1,
+		expectedContToken: "",
+		expectedErr:       nil,
+	})
+	tests = append(tests, testCase{
+		description: "ListByOptions with many objects matching many labels with OR",
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
+			{
+				[]sqltypes.Filter{
+					{
+						Field:   []string{"metadata", "labels", "cows"},
+						Matches: []string{"milk"},
+						Op:      sqltypes.Eq,
+					},
+					{
+						Field:   []string{"metadata", "labels", "horses"},
+						Matches: []string{"shoes"},
+						Op:      sqltypes.Eq,
+					},
+				},
+			},
+		},
+		},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, obj02_milk_saddles, obj02b_milk_shoes, obj03a_shoes, obj04_milk),
+		expectedTotal:     4,
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
@@ -836,6 +1002,25 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 		expectedErr:       nil,
 	})
 	tests = append(tests, testCase{
+		description: "ListByOptions sorting on two existing labels, with no label filters, should sort correctly",
+		listOptions: sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "labels", "horses"},
+					},
+					{
+						Fields: []string{"metadata", "labels", "cows"},
+					},
+				},
+			},
+		},
+		partitions: []partition.Partition{{All: true}},
+		expectedList: makeList(t, obj02a_beef_saddles, obj02_milk_saddles, obj03_saddles,
+			obj02b_milk_shoes, obj03a_shoes, obj04_milk, obj01_no_labels, obj05__guard_lodgepole),
+		expectedTotal: len(allObjects),
+	})
+	tests = append(tests, testCase{
 		description: "ListByOptions with Pagination.PageSize set should set limit to PageSize",
 		listOptions: sqltypes.ListOptions{
 			Pagination: sqltypes.Pagination{
@@ -977,6 +1162,127 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 		expectedContToken: "",
 		expectedErr:       nil,
 	})
+	tests = append(tests, testCase{
+		description: "ListByOptions with a positive projectsornamespaces test should work",
+		listOptions: sqltypes.ListOptions{
+			ProjectsOrNamespaces: sqltypes.OrFilter{
+				Filters: []sqltypes.Filter{
+					{
+						Field:   []string{"metadata", "name"},
+						Matches: []string{"ns-b"},
+						Op:      sqltypes.In,
+					},
+					{
+						Field:   []string{"metadata", "labels", "field.cattle.io/projectId"},
+						Matches: []string{"ns-b"},
+						Op:      sqltypes.In,
+					},
+				},
+			},
+		},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, obj05__guard_lodgepole),
+		expectedTotal:     1,
+		expectedContToken: "",
+		expectedErr:       nil,
+	})
+	tests = append(tests, testCase{
+		description: "ListByOptions with a negative projectsornamespaces test should work",
+		listOptions: sqltypes.ListOptions{
+			ProjectsOrNamespaces: sqltypes.OrFilter{
+				Filters: []sqltypes.Filter{
+					{
+						Field:   []string{"metadata", "name"},
+						Matches: []string{"ns-a"},
+						Op:      sqltypes.NotIn,
+					},
+					{
+						Field:   []string{"metadata", "labels", "field.cattle.io/projectId"},
+						Matches: []string{"ns-a"},
+						Op:      sqltypes.NotIn,
+					},
+				},
+			},
+		},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, obj05__guard_lodgepole),
+		expectedTotal:     1,
+		expectedContToken: "",
+		expectedErr:       nil,
+	})
+	tests = append(tests, testCase{
+		description: "ListByOptions() with listOptions.Revision set equals to latestRV should work",
+		listOptions: sqltypes.ListOptions{
+			Revision: "9999",
+		},
+		latestRV:   "9999",
+		partitions: []partition.Partition{},
+		ns:         "",
+		// setting resource version on unstructured list
+		expectedList: func() *unstructured.UnstructuredList {
+			list := makeList(t)
+			list.SetResourceVersion("9999")
+			return list
+		}(),
+		expectedTotal:     0,
+		expectedContToken: "",
+		expectedErr:       nil,
+	})
+	tests = append(tests, testCase{
+		description: "ListByOptions() with listOptions.Revision set to lower than latestRV should work",
+		listOptions: sqltypes.ListOptions{
+			Revision: "9999",
+		},
+		latestRV:   "10000",
+		partitions: []partition.Partition{},
+		ns:         "",
+		// setting resource version on unstructured list
+		expectedList: func() *unstructured.UnstructuredList {
+			list := makeList(t)
+			list.SetResourceVersion("10000")
+			return list
+		}(),
+		expectedTotal:     0,
+		expectedContToken: "",
+		expectedErr:       nil,
+	})
+	tests = append(tests, testCase{
+		description: "ListByOptions() with listOptions.Revision set to higher than latestRV, should return 'unknown revision'",
+		listOptions: sqltypes.ListOptions{
+			Revision: "10000",
+		},
+		latestRV:          "9999",
+		partitions:        []partition.Partition{},
+		ns:                "",
+		expectedList:      &unstructured.UnstructuredList{},
+		expectedTotal:     0,
+		expectedContToken: "",
+		expectedErr:       ErrUnknownRevision,
+	})
+
+	tests = append(tests, testCase{
+		description: "ListByOptions: sorting on ip sorts on the ip octets",
+		listOptions: sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields:   []string{"status", "podIP"},
+						Order:    sqltypes.ASC,
+						SortAsIP: true,
+					},
+				},
+			},
+		},
+		partitions:   []partition.Partition{{All: true}},
+		ns:           "",
+		expectedList: makeList(t, obj03_saddles, obj01_no_labels, obj02_milk_saddles, obj02a_beef_saddles, obj03a_shoes, obj04_milk, obj02b_milk_shoes, obj05__guard_lodgepole),
+
+		expectedTotal:     len(allObjects),
+		expectedContToken: "",
+		expectedErr:       nil,
+	})
 	//tests = append(tests, testCase{
 	//	description: "ListByOptions with a Namespace Partition should select only items where metadata.namespace is equal to Namespace and all other conditions are met",
 	//	partitions: []partition.Partition{
@@ -994,11 +1300,14 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 
 	t.Parallel()
 
+	// First curl the namespaces to load up the namespace database tables.
+
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
 			fields := [][]string{
 				{"metadata", "somefield"},
 				{"status", "someotherfield"},
+				{"status", "podIP"},
 				{"metadata", "unknown"},
 				{"metadata", "sortfield"},
 			}
@@ -1008,20 +1317,27 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 				Fields:       fields,
 				IsNamespaced: true,
 			}
-			loi, dbPath, err := makeListOptionIndexer(ctx, opts, false)
+			if test.description == "ListByOptions with a positive projectsornamespaces test should work" {
+				fmt.Println("Stop here")
+			}
+			loi, dbPath, err := makeListOptionIndexer(ctx, gvk, opts, false, namespaceList)
 			defer cleanTempFiles(dbPath)
-			assert.NoError(t, err)
 
 			for _, item := range itemList.Items {
 				err = loi.Add(&item)
 				assert.NoError(t, err)
 			}
+			if test.description == "ListByOptions with a positive projectsornamespaces test should work" {
+				fmt.Println("Stop here")
+			}
 
+			loi.latestRV = test.latestRV
 			list, total, contToken, err := loi.ListByOptions(ctx, &test.listOptions, test.partitions, test.ns)
 			if test.expectedErr != nil {
 				assert.Error(t, err)
 				return
 			}
+			require.Nil(t, err)
 
 			assert.Equal(t, test.expectedTotal, total)
 			assert.Equal(t, test.expectedList, list)
@@ -1030,9 +1346,386 @@ func TestNewListOptionIndexerEasy(t *testing.T) {
 	}
 }
 
+func TestNewListOptionIndexerTypeGuidance(t *testing.T) {
+	gvk := corev1.SchemeGroupVersion.WithKind("TestKind")
+	obj01 := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
+		"metadata": map[string]any{
+			"name":             "obj01",
+			"namespace":        "ns-a",
+			"someNumericValue": "1",
+			"favoriteFruit":    "14banana",
+		},
+	}
+	obj05 := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
+		"metadata": map[string]any{
+			"name":             "obj05",
+			"namespace":        "ns-a",
+			"someNumericValue": "5",
+			"favoriteFruit":    "130raspberries",
+		},
+	}
+	obj11 := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
+		"metadata": map[string]any{
+			"name":             "obj11",
+			"namespace":        "ns-a",
+			"someNumericValue": "11",
+			"favoriteFruit":    "9lime",
+		},
+	}
+	// obj17: favoriteFruit is entered as a string
+	// obj18: favoriteFruit is entered as an integer
+	obj17 := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
+		"metadata": map[string]any{
+			"name":             "obj17",
+			"namespace":        "ns-a",
+			"someNumericValue": "17",
+			"favoriteFruit":    "17",
+		},
+	}
+	obj18 := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
+		"metadata": map[string]any{
+			"name":             "obj18",
+			"namespace":        "ns-a",
+			"someNumericValue": "18",
+			"favoriteFruit":    int64(18),
+		},
+	}
+	obj100 := map[string]any{
+		"apiVersion": gvk.Version,
+		"kind":       gvk.Kind,
+		"metadata": map[string]any{
+			"name":             "obj100",
+			"namespace":        "ns-a",
+			"someNumericValue": "100",
+			"favoriteFruit":    "guava",
+		},
+	}
+	// construct the source list so it isn't sorted either ASC or DESC
+	allObjects := []map[string]any{
+		obj18,
+		obj01,
+		obj11,
+		obj05,
+		obj17,
+		obj100,
+	}
+	ns_a := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Namespace",
+		"metadata": map[string]any{
+			"name": "ns-a",
+		},
+	}
+
+	itemList := makeList(t, allObjects...)
+	namespaceList := makeList(t, ns_a)
+	fields := [][]string{
+		{"metadata", "someNumericValue"},
+		{"metadata", "favoriteFruit"},
+	}
+	type testCase struct {
+		description          string
+		opts                 ListOptionIndexerOptions
+		sortFields           []string
+		expectedListAscObjs  []map[string]any
+		expectedListDescObjs []map[string]any
+	}
+
+	var tests []testCase
+	tests = append(tests,
+		testCase{
+			description: "TestNewListOptionIndexerTypeGuidance() with type-guidance INT on non-ints sorts as string",
+			opts: ListOptionIndexerOptions{
+				Fields:       fields,
+				IsNamespaced: true,
+				TypeGuidance: map[string]string{
+					"metadata.someNumericValue": "INT",
+				},
+			},
+			sortFields:           []string{"metadata", "someNumericValue"},
+			expectedListAscObjs:  []map[string]any{obj01, obj05, obj11, obj17, obj18, obj100},
+			expectedListDescObjs: []map[string]any{obj100, obj18, obj17, obj11, obj05, obj01},
+		})
+	tests = append(tests,
+		testCase{description: "TestNewListOptionIndexerTypeGuidance() without type-guidance sorts as strings",
+			opts: ListOptionIndexerOptions{
+				Fields:       fields,
+				IsNamespaced: true,
+			},
+			sortFields:           []string{"metadata", "someNumericValue"},
+			expectedListAscObjs:  []map[string]any{obj01, obj100, obj11, obj17, obj18, obj05},
+			expectedListDescObjs: []map[string]any{obj05, obj18, obj17, obj11, obj100, obj01},
+		})
+	// This is what's going on with the sorting on a non-numeric value stored as an INT
+	// Because some values are non-numeric, sorting is by ASCII
+	//sqlite> select "metadata.name", "metadata.favoriteFruit" from _v1_ConfigMap_fields
+	//        order by "metadata.favoriteFruit";
+	//obj17|17
+	//obj18|18
+	//obj05|130raspberries
+	//obj01|14banana
+	//obj11|9lime
+	//obj100|guava
+
+	// Sorting is still by ascii -- adding 1 to the value in display shows that
+	//sqlite> select "metadata.name", "metadata.favoriteFruit" + 1 from _v1_ConfigMap_fields
+	//        order by "metadata.favoriteFruit";
+	//obj17|18
+	//obj18|19
+	//obj05|131
+	//obj01|15
+	//obj11|10
+	//obj100|1
+
+	// This one forces numeric sorting
+	//sqlite> select "metadata.name", "metadata.favoriteFruit" + 1 from _v1_ConfigMap_fields
+	//        order by "metadata.favoriteFruit" + 1;
+	//obj100|1
+	//obj11|10
+	//obj01|15
+	//obj17|18
+	//obj18|19
+	//obj05|131
+	tests = append(tests,
+		testCase{description: "TestNewListOptionIndexerTypeGuidance() with type-guidance as int on a non-number sorts as string",
+			opts: ListOptionIndexerOptions{
+				Fields:       fields,
+				IsNamespaced: true,
+				TypeGuidance: map[string]string{
+					"metadata.favoriteFruit": "INT",
+				},
+			},
+			sortFields:           []string{"metadata", "favoriteFruit"},
+			expectedListAscObjs:  []map[string]any{obj17, obj18, obj05, obj01, obj11, obj100},
+			expectedListDescObjs: []map[string]any{obj100, obj11, obj01, obj05, obj18, obj17},
+		})
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			loi, dbPath, err := makeListOptionIndexer(t.Context(), gvk, test.opts, false, namespaceList)
+			defer cleanTempFiles(dbPath)
+			require.NoError(t, err)
+
+			for _, item := range itemList.Items {
+				err = loi.Add(&item)
+				require.NoError(t, err)
+			}
+
+			expectedList := makeList(t, test.expectedListAscObjs...)
+			list, total, _, err := loi.ListByOptions(t.Context(), &sqltypes.ListOptions{
+				SortList: sqltypes.SortList{
+					SortDirectives: []sqltypes.Sort{
+						{
+							Fields: test.sortFields,
+							Order:  sqltypes.ASC,
+						},
+					},
+				},
+			}, []partition.Partition{{All: true}}, "")
+			require.NoError(t, err)
+			assert.Equal(t, len(allObjects), total)
+			assert.Equal(t, expectedList, list)
+
+			expectedList = makeList(t, test.expectedListDescObjs...)
+			list, total, _, err = loi.ListByOptions(t.Context(), &sqltypes.ListOptions{
+				SortList: sqltypes.SortList{
+					SortDirectives: []sqltypes.Sort{
+						{
+							Fields: test.sortFields,
+							Order:  sqltypes.DESC,
+						},
+					},
+				},
+			}, []partition.Partition{{All: true}}, "")
+			require.NoError(t, err)
+			assert.Equal(t, len(allObjects), total)
+			assert.Equal(t, expectedList, list)
+		})
+	}
+}
+
+func TestDropAll(t *testing.T) {
+	ctx := t.Context()
+
+	gvk := corev1.SchemeGroupVersion.WithKind("ConfigMap")
+	opts := ListOptionIndexerOptions{
+		IsNamespaced: true,
+	}
+	loi, dbPath, err := makeListOptionIndexer(ctx, gvk, opts, false, nil)
+	defer cleanTempFiles(dbPath)
+	assert.NoError(t, err)
+
+	obj1 := &unstructured.Unstructured{
+		Object: map[string]any{
+			"metadata": map[string]any{
+				"name": "obj1",
+			},
+		},
+	}
+	obj1.SetGroupVersionKind(gvk)
+	err = loi.Add(obj1)
+	assert.NoError(t, err)
+
+	_, _, _, err = loi.ListByOptions(ctx, &sqltypes.ListOptions{}, []partition.Partition{{All: true}}, "")
+	assert.NoError(t, err)
+
+	loi.DropAll(ctx)
+
+	_, _, _, err = loi.ListByOptions(ctx, &sqltypes.ListOptions{}, []partition.Partition{{All: true}}, "")
+	assert.Error(t, err)
+}
+
+func makePseudoRandomList(gvk schema.GroupVersionKind, size int) *unstructured.UnstructuredList {
+	numLength := 1 + int(math.Floor(math.Log10(float64(size))))
+	name_template := fmt.Sprintf("n%%0%dd", numLength)
+	// Make a predictable but randomish list of numbers
+	// item 0: ns0, n0
+	// item 23: ns0, n1
+	// item 46: ns0, n2
+	// At some point the index will be set back to the start
+	// the ns value goes up every <ns_delta> hits
+	// the name_val is the index, and i provides the name-value as we walk through the array.
+	// Use any size, as long as both name_delta (23) and ns_delta (17) are relatively prime to it.
+	// This assures that every index in the array will be initialized to an actual object
+	name_val := 0
+	name_delta := 23 // space the names out in runs of 23
+
+	ns_val := 0
+	ns_block := 0
+	ns_delta := 17 // so only 17 namespaces
+	namespace_template := "ns%02d"
+
+	items := make([]unstructured.Unstructured, size)
+	for i := range size {
+		nv := fmt.Sprintf(name_template, i)
+		nsv := fmt.Sprintf(namespace_template, ns_block)
+		obj := unstructured.Unstructured{
+			Object: map[string]any{
+				"metadata": map[string]any{
+					"name":      nv,
+					"namespace": nsv,
+				},
+				"id": nv + "/" + nsv,
+			},
+		}
+		obj.SetGroupVersionKind(gvk)
+		items[name_val] = obj
+		name_val += name_delta
+		if name_val >= size {
+			name_val -= size
+		}
+		ns_val += ns_delta
+		if ns_val >= size {
+			ns_val -= size
+			ns_block += 1
+		}
+	}
+	ulist := &unstructured.UnstructuredList{
+		Items: items,
+	}
+	ulist.SetGroupVersionKind(gvk)
+	return ulist
+}
+
+func verifyListIsSorted(b *testing.B, list *unstructured.UnstructuredList, size int) {
+	for i := range size - 1 {
+		curr := list.Items[i]
+		next := list.Items[i+1]
+		if curr.GetNamespace() == next.GetNamespace() {
+			assert.Less(b, curr.GetName(), next.GetName())
+		} else {
+			assert.Less(b, curr.GetNamespace(), next.GetNamespace())
+		}
+	}
+}
+func BenchmarkNamespaceNameList(b *testing.B) {
+	// At 50,000,000 this starts to get very slow
+	size := 10000
+	gvk := corev1.SchemeGroupVersion.WithKind("ConfigMap")
+	itemList := makePseudoRandomList(gvk, size)
+	ctx := context.Background()
+	opts := ListOptionIndexerOptions{
+		IsNamespaced: true,
+	}
+	loi, dbPath, err := makeListOptionIndexer(ctx, gvk, opts, false, emptyNamespaceList)
+	defer cleanTempFiles(dbPath)
+	assert.NoError(b, err)
+	for _, item := range itemList.Items {
+		err = loi.Add(&item)
+		assert.NoError(b, err)
+	}
+	b.Run(fmt.Sprintf("sort-%d with explicit namespace/name", size), func(b *testing.B) {
+		listOptions := sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "namespace"},
+						Order:  sqltypes.ASC,
+					},
+					{
+						Fields: []string{"metadata", "name"},
+						Order:  sqltypes.ASC,
+					},
+				},
+			},
+		}
+		partitions := []partition.Partition{{All: true}}
+		ns := ""
+		list, total, _, err := loi.ListByOptions(ctx, &listOptions, partitions, ns)
+		if err != nil {
+			b.Fatal("error getting data", err)
+		}
+		if total != size {
+			b.Errorf("expecting %d items, got %d", size, total)
+		}
+		if len(list.Items) != size {
+			b.Errorf("expecting %d items, got %d", size, len(list.Items))
+		}
+		//verifyListIsSorted(b, list, size)
+	})
+	b.Run(fmt.Sprintf("sort-%d with explicit id", size), func(b *testing.B) {
+		listOptions := sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"id"},
+						Order:  sqltypes.ASC,
+					},
+				},
+			},
+		}
+		partitions := []partition.Partition{{All: true}}
+		ns := ""
+		list, total, _, err := loi.ListByOptions(ctx, &listOptions, partitions, ns)
+		if err != nil {
+			b.Fatal("error getting data", err)
+		}
+		if total != size {
+			b.Errorf("expecting %d items, got %d", size, total)
+		}
+		if len(list.Items) != size {
+			b.Errorf("expecting %d items, got %d", size, len(list.Items))
+		}
+		//verifyListIsSorted(b, list, size)
+	})
+
+}
+
 func TestUserDefinedExtractFunction(t *testing.T) {
+	gvk := corev1.SchemeGroupVersion.WithKind("Pod")
 	makeObj := func(name string, barSeparatedHosts string) map[string]any {
 		h1 := map[string]any{
+			"apiVersion": gvk.Version,
+			"kind":       gvk.Kind,
 			"metadata": map[string]any{
 				"name": name,
 			},
@@ -1218,7 +1911,366 @@ func TestUserDefinedExtractFunction(t *testing.T) {
 				Fields:       fields,
 				IsNamespaced: true,
 			}
-			loi, dbPath, err := makeListOptionIndexer(ctx, opts, false)
+			loi, dbPath, err := makeListOptionIndexer(ctx, gvk, opts, false, emptyNamespaceList)
+			defer cleanTempFiles(dbPath)
+			assert.NoError(t, err)
+
+			for _, item := range itemList.Items {
+				err = loi.Add(&item)
+				assert.NoError(t, err)
+			}
+
+			list, total, contToken, err := loi.ListByOptions(ctx, &test.listOptions, test.partitions, test.ns)
+			if test.expectedErr != nil {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, test.expectedList, list)
+			assert.Equal(t, test.expectedTotal, total)
+			assert.Equal(t, test.expectedContToken, contToken)
+		})
+	}
+}
+
+func TestUserDefinedInetToAnonFunction(t *testing.T) {
+	gvk := corev1.SchemeGroupVersion.WithKind("Pod")
+	makeObj := func(name string, ipAddr string) map[string]any {
+		h1 := map[string]any{
+			"apiVersion": gvk.Version,
+			"kind":       gvk.Kind,
+			"metadata": map[string]any{
+				"name": name,
+			},
+			"status": map[string]any{
+				"podIP": ipAddr,
+			},
+		}
+		return h1
+	}
+	ctx := context.Background()
+
+	type testCase struct {
+		description string
+		listOptions sqltypes.ListOptions
+		partitions  []partition.Partition
+		ns          string
+
+		items []*unstructured.Unstructured
+
+		extraIndexedFields [][]string
+		expectedList       *unstructured.UnstructuredList
+		expectedTotal      int
+		expectedContToken  string
+		expectedErr        error
+	}
+	obj01 := makeObj("lirdle.com", "145.53.12.123")
+	obj02 := makeObj("cyberciti.biz", "2607:f0d0:1002:51::4")
+	obj03 := makeObj("zombo.com", "50.28.52.163")
+	obj04 := makeObj("not-an-ipaddr", "aardvarks")
+	obj05 := makeObj("smaller-cyberciti.biz", "2607:f0d0:997:51::4")
+	allObjects := []map[string]any{obj01, obj02, obj03, obj04, obj05}
+	makeList := func(t *testing.T, objs ...map[string]any) *unstructured.UnstructuredList {
+		t.Helper()
+
+		if len(objs) == 0 {
+			return &unstructured.UnstructuredList{Object: map[string]any{"items": []any{}}, Items: []unstructured.Unstructured{}}
+		}
+
+		var items []any
+		for _, obj := range objs {
+			items = append(items, obj)
+		}
+
+		list := &unstructured.Unstructured{
+			Object: map[string]any{
+				"items": items,
+			},
+		}
+
+		itemList, err := list.ToList()
+		require.NoError(t, err)
+
+		return itemList
+	}
+	itemList := makeList(t, allObjects...)
+
+	var tests []testCase
+	tests = append(tests, testCase{
+		description: "sort by numeric IP addr value",
+		listOptions: sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields:   []string{"status", "podIP"},
+						Order:    sqltypes.ASC,
+						SortAsIP: true,
+					},
+				},
+			},
+		},
+		partitions:        []partition.Partition{{All: true}},
+		ns:                "",
+		expectedList:      makeList(t, obj04, obj03, obj01, obj05, obj02),
+		expectedTotal:     len(allObjects),
+		expectedContToken: "",
+		expectedErr:       nil,
+	})
+	t.Parallel()
+
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			fields := [][]string{
+				{"status", "podIP"},
+			}
+			fields = append(fields, test.extraIndexedFields...)
+
+			opts := ListOptionIndexerOptions{
+				Fields:       fields,
+				IsNamespaced: true,
+			}
+			loi, dbPath, err := makeListOptionIndexer(ctx, gvk, opts, false, emptyNamespaceList)
+			defer cleanTempFiles(dbPath)
+			assert.NoError(t, err)
+
+			for _, item := range itemList.Items {
+				err = loi.Add(&item)
+				assert.NoError(t, err)
+			}
+
+			list, total, contToken, err := loi.ListByOptions(ctx, &test.listOptions, test.partitions, test.ns)
+			if test.expectedErr != nil {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, test.expectedList, list)
+			assert.Equal(t, test.expectedTotal, total)
+			assert.Equal(t, test.expectedContToken, contToken)
+		})
+	}
+}
+
+func TestUserDefinedMemoryFunction(t *testing.T) {
+	gvk := corev1.SchemeGroupVersion.WithKind("Pod")
+	makeObj := func(name string, cpuCount int, memory string, podCount int) map[string]any {
+		if cpuCount < 1 {
+			cpuCount = 1
+		}
+		if memory == "" {
+			memory = "1Gi"
+		}
+		if podCount < 1 {
+			podCount = 1
+		}
+		cpuCountAvailable := cpuCount - 1
+		if cpuCountAvailable < 1 {
+			cpuCountAvailable = 1
+		}
+		podCountAvailable := podCount - 1
+		if podCountAvailable < 1 {
+			podCountAvailable = 1
+		}
+		h1 := map[string]any{
+			"apiVersion": gvk.Version,
+			"kind":       gvk.Kind,
+			"metadata": map[string]any{
+				"name": name,
+			},
+			"status": map[string]any{
+				"allocatable": map[string]any{
+					"cpu":    fmt.Sprintf("%d", cpuCount),
+					"memory": memory,
+					"pods":   fmt.Sprintf("%d", podCount),
+				},
+			},
+		}
+		lastDigit := name[len(name)-1:]
+		val, err := strconv.Atoi(lastDigit)
+		if err == nil && val%2 == 1 {
+			newMap := map[string]any{
+				"cpu":    fmt.Sprintf("%d", cpuCountAvailable),
+				"memory": memory,
+				"pods":   fmt.Sprintf("%d", podCountAvailable),
+			}
+			statusMap := h1["status"].(map[string]any)
+			statusMap["requested"] = any(newMap)
+		}
+		return h1
+	}
+
+	type testCase struct {
+		description string
+		listOptions sqltypes.ListOptions
+		partitions  []partition.Partition
+		ns          string
+
+		items []*unstructured.Unstructured
+
+		extraIndexedFields [][]string
+		expectedList       *unstructured.UnstructuredList
+		expectedTotal      int
+		expectedContToken  string
+		expectedErr        error
+	}
+
+	obj01 := makeObj("obj01", 8, "1000", 2)
+	obj02 := makeObj("obj02", 7, "12K", 12)
+	obj03 := makeObj("obj03", 6, "3Ki", 3)
+	obj04 := makeObj("obj04", 5, "8M", 13)
+	obj05 := makeObj("obj05", 4, "12Mi", 25)
+	obj06 := makeObj("obj06", 3, "71M", 5)
+	obj07 := makeObj("obj07", 2, "55G", 24)
+	obj08 := makeObj("obj08", 1, "104Gi", 4)
+	allObjects := []map[string]any{obj01, obj02, obj03, obj04, obj05, obj06, obj07, obj08}
+	ctx := context.Background()
+
+	makeList := func(t *testing.T, objs ...map[string]any) *unstructured.UnstructuredList {
+		t.Helper()
+
+		if len(objs) == 0 {
+			return &unstructured.UnstructuredList{Object: map[string]any{"items": []any{}}, Items: []unstructured.Unstructured{}}
+		}
+
+		var items []any
+		for _, obj := range objs {
+			items = append(items, obj)
+		}
+
+		list := &unstructured.Unstructured{
+			Object: map[string]any{
+				"items": items,
+			},
+		}
+
+		itemList, err := list.ToList()
+		require.NoError(t, err)
+
+		return itemList
+	}
+	itemList := makeList(t, allObjects...)
+
+	var tests []testCase
+	tests = append(tests, testCase{
+		description: "filtering on cpu works",
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
+			{
+				[]sqltypes.Filter{
+					{
+						Field:   []string{"status", "allocatable", "cpu"},
+						Matches: []string{"7"},
+						Op:      sqltypes.Eq,
+					},
+				},
+			},
+		},
+		},
+		expectedList:  makeList(t, obj02),
+		expectedTotal: 1,
+	})
+	tests = append(tests, testCase{
+		description: "filtering on pod-count works",
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
+			{
+				[]sqltypes.Filter{
+					{
+						Field:   []string{"status", "allocatable", "pods"},
+						Matches: []string{"25"},
+						Op:      sqltypes.Eq,
+					},
+				},
+			},
+		},
+		},
+		expectedList:  makeList(t, obj05),
+		expectedTotal: 1,
+	})
+	tests = append(tests, testCase{
+		description: "filtering on memory works",
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
+			{
+				[]sqltypes.Filter{
+					{
+						Field:   []string{"status", "allocatable", "memory"},
+						Matches: []string{"8M"},
+						Op:      sqltypes.Eq,
+					},
+				},
+			},
+		},
+		},
+		expectedList:  makeList(t, obj04),
+		expectedTotal: 1,
+	})
+	tests = append(tests, testCase{
+		description: "sorting on memory does a naive ascii sort",
+		listOptions: sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"status", "allocatable", "memory"},
+						Order:  sqltypes.ASC,
+					},
+				},
+			},
+		},
+		expectedList:  makeList(t, obj01, obj08, obj02, obj05, obj03, obj07, obj06, obj04),
+		expectedTotal: len(allObjects),
+	})
+	tests = append(tests, testCase{
+		description: "filtering on requested pod-count works",
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
+			{
+				[]sqltypes.Filter{
+					{
+						Field:   []string{"status", "requested", "pods"},
+						Matches: []string{"24"},
+						Op:      sqltypes.Eq,
+					},
+				},
+			},
+		},
+		},
+		expectedList:  makeList(t, obj05),
+		expectedTotal: 1,
+	})
+	tests = append(tests, testCase{
+		description: "filtering on requested cpu-count works",
+		listOptions: sqltypes.ListOptions{Filters: []sqltypes.OrFilter{
+			{
+				[]sqltypes.Filter{
+					{
+						Field:   []string{"status", "requested", "cpu"},
+						Matches: []string{"1", "3"},
+						Op:      sqltypes.In,
+					},
+				},
+			},
+		},
+		},
+		expectedList:  makeList(t, obj07, obj05),
+		expectedTotal: 2,
+	})
+
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			fields := [][]string{
+				{"status", "allocatable", "cpu"},
+				{"status", "allocatable", "memory"},
+				{"status", "allocatable", "pods"},
+				{"status", "requested", "cpu"},
+				{"status", "requested", "memory"},
+				{"status", "requested", "pods"},
+			}
+			fields = append(fields, test.extraIndexedFields...)
+			if len(test.partitions) == 0 {
+				test.partitions = []partition.Partition{{All: true}}
+			}
+			opts := ListOptionIndexerOptions{
+				Fields:       fields,
+				IsNamespaced: true,
+			}
+			loi, dbPath, err := makeListOptionIndexer(ctx, gvk, opts, false, emptyNamespaceList)
 			defer cleanTempFiles(dbPath)
 			assert.NoError(t, err)
 
@@ -1270,7 +2322,7 @@ func TestConstructQuery(t *testing.T) {
 		},
 		partitions: []partition.Partition{},
 		ns:         "",
-		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
+		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
   JOIN "something_fields" f ON o.key = f.key
   WHERE
     (f."metadata.queryField1" IN (?)) AND
@@ -1295,13 +2347,153 @@ func TestConstructQuery(t *testing.T) {
 		},
 		partitions: []partition.Partition{},
 		ns:         "",
-		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
+		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
   JOIN "something_fields" f ON o.key = f.key
   WHERE
     (f."metadata.queryField1" NOT IN (?)) AND
     (FALSE)
   ORDER BY f."metadata.name" ASC `,
 		expectedStmtArgs: []any{"somevalue"},
+		expectedErr:      nil,
+	})
+	tests = append(tests, testCase{
+		description: "TestConstructQuery: handles ProjectOrNamespaces IN",
+		listOptions: sqltypes.ListOptions{
+			ProjectsOrNamespaces: sqltypes.OrFilter{
+				Filters: []sqltypes.Filter{
+					sqltypes.Filter{
+						Field:   []string{"metadata", "name"},
+						Matches: []string{"some_namespace"},
+						Op:      sqltypes.In,
+					},
+					sqltypes.Filter{
+						Field:   []string{"metadata", "labels", "field.cattle.io/projectId"},
+						Matches: []string{"some_namespace"},
+						Op:      sqltypes.In,
+					},
+				},
+			},
+			Filters: []sqltypes.OrFilter{},
+		},
+		partitions: []partition.Partition{
+			{
+				All: true,
+			},
+		},
+		ns: "",
+		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
+  JOIN "something_fields" f ON o.key = f.key
+  LEFT OUTER JOIN "_v1_Namespace_fields" nsf ON f."metadata.namespace" = nsf."metadata.name"
+  LEFT OUTER JOIN "_v1_Namespace_labels" lt1 ON nsf.key = lt1.key
+  WHERE
+    ((nsf."metadata.name" IN (?)) OR (lt1.label = ? AND lt1.value IN (?)))
+  ORDER BY f."metadata.name" ASC `,
+		expectedStmtArgs: []any{"some_namespace", "field.cattle.io/projectId", "some_namespace"},
+		expectedErr:      nil,
+	})
+	tests = append(tests, testCase{
+		description: "TestConstructQuery: handles ProjectOrNamespaces multiple IN",
+		listOptions: sqltypes.ListOptions{
+			ProjectsOrNamespaces: sqltypes.OrFilter{
+				Filters: []sqltypes.Filter{
+					sqltypes.Filter{
+						Field:   []string{"metadata", "name"},
+						Matches: []string{"some_namespace", "p-example"},
+						Op:      sqltypes.In,
+					},
+					sqltypes.Filter{
+						Field:   []string{"metadata", "labels", "field.cattle.io/projectId"},
+						Matches: []string{"some_namespace", "p-example"},
+						Op:      sqltypes.In,
+					},
+				},
+			},
+			Filters: []sqltypes.OrFilter{},
+		},
+		partitions: []partition.Partition{
+			{
+				All: true,
+			},
+		},
+		ns: "",
+		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
+  JOIN "something_fields" f ON o.key = f.key
+  LEFT OUTER JOIN "_v1_Namespace_fields" nsf ON f."metadata.namespace" = nsf."metadata.name"
+  LEFT OUTER JOIN "_v1_Namespace_labels" lt1 ON nsf.key = lt1.key
+  WHERE
+    ((nsf."metadata.name" IN (?, ?)) OR (lt1.label = ? AND lt1.value IN (?, ?)))
+  ORDER BY f."metadata.name" ASC `,
+		expectedStmtArgs: []any{"some_namespace", "p-example", "field.cattle.io/projectId", "some_namespace", "p-example"},
+		expectedErr:      nil,
+	})
+	tests = append(tests, testCase{
+		description: "TestConstructQuery: handles ProjectOrNamespaces NOT IN",
+		listOptions: sqltypes.ListOptions{
+			ProjectsOrNamespaces: sqltypes.OrFilter{
+				Filters: []sqltypes.Filter{
+					sqltypes.Filter{
+						Field:   []string{"metadata", "name"},
+						Matches: []string{"some_namespace"},
+						Op:      sqltypes.NotIn,
+					},
+					sqltypes.Filter{
+						Field:   []string{"metadata", "labels", "field.cattle.io/projectId"},
+						Matches: []string{"some_namespace"},
+						Op:      sqltypes.NotIn,
+					},
+				},
+			},
+			Filters: []sqltypes.OrFilter{},
+		},
+		partitions: []partition.Partition{{All: true}},
+		ns:         "",
+		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
+  JOIN "something_fields" f ON o.key = f.key
+  LEFT OUTER JOIN "_v1_Namespace_fields" nsf ON f."metadata.namespace" = nsf."metadata.name"
+  LEFT OUTER JOIN "_v1_Namespace_labels" lt1 ON nsf.key = lt1.key
+  WHERE
+    ((nsf."metadata.name" NOT IN (?)) AND ((lt1.label = ? AND lt1.value NOT IN (?)) OR (o.key NOT IN (SELECT o1.key FROM "something" o1
+		JOIN "something_fields" f1 ON o1.key = f1.key
+		LEFT OUTER JOIN "_v1_Namespace_fields" nsf1 ON f1."metadata.namespace" = nsf1."metadata.name"
+		LEFT OUTER JOIN "_v1_Namespace_labels" lt1i1 ON nsf1.key = lt1i1.key
+		WHERE lt1i1.label = ?))))
+  ORDER BY f."metadata.name" ASC `,
+		expectedStmtArgs: []any{"some_namespace", "field.cattle.io/projectId", "some_namespace", "field.cattle.io/projectId"},
+		expectedErr:      nil,
+	})
+	tests = append(tests, testCase{
+		description: "TestConstructQuery: handles ProjectOrNamespaces multiple NOT IN",
+		listOptions: sqltypes.ListOptions{
+			ProjectsOrNamespaces: sqltypes.OrFilter{
+				Filters: []sqltypes.Filter{
+					sqltypes.Filter{
+						Field:   []string{"metadata", "name"},
+						Matches: []string{"some_namespace", "p-example"},
+						Op:      sqltypes.NotIn,
+					},
+					sqltypes.Filter{
+						Field:   []string{"metadata", "labels", "field.cattle.io/projectId"},
+						Matches: []string{"some_namespace", "p-example"},
+						Op:      sqltypes.NotIn,
+					},
+				},
+			},
+			Filters: []sqltypes.OrFilter{},
+		},
+		partitions: []partition.Partition{{All: true}},
+		ns:         "",
+		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
+  JOIN "something_fields" f ON o.key = f.key
+  LEFT OUTER JOIN "_v1_Namespace_fields" nsf ON f."metadata.namespace" = nsf."metadata.name"
+  LEFT OUTER JOIN "_v1_Namespace_labels" lt1 ON nsf.key = lt1.key
+  WHERE
+    ((nsf."metadata.name" NOT IN (?, ?)) AND ((lt1.label = ? AND lt1.value NOT IN (?, ?)) OR (o.key NOT IN (SELECT o1.key FROM "something" o1
+		JOIN "something_fields" f1 ON o1.key = f1.key
+		LEFT OUTER JOIN "_v1_Namespace_fields" nsf1 ON f1."metadata.namespace" = nsf1."metadata.name"
+		LEFT OUTER JOIN "_v1_Namespace_labels" lt1i1 ON nsf1.key = lt1i1.key
+		WHERE lt1i1.label = ?))))
+  ORDER BY f."metadata.name" ASC `,
+		expectedStmtArgs: []any{"some_namespace", "p-example", "field.cattle.io/projectId", "some_namespace", "p-example", "field.cattle.io/projectId"},
 		expectedErr:      nil,
 	})
 	tests = append(tests, testCase{
@@ -1680,7 +2872,7 @@ func TestConstructQuery(t *testing.T) {
 		},
 		partitions: []partition.Partition{},
 		ns:         "",
-		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
+		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
   JOIN "something_fields" f ON o.key = f.key
   WHERE
     (extractBarredValue(f."spec.containers.image", "3") = ?) AND
@@ -1703,7 +2895,7 @@ func TestConstructQuery(t *testing.T) {
 		},
 		partitions: []partition.Partition{},
 		ns:         "",
-		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
+		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
   JOIN "something_fields" f ON o.key = f.key
   WHERE
     (FALSE)
@@ -1736,7 +2928,7 @@ func TestConstructQuery(t *testing.T) {
 		},
 		partitions: []partition.Partition{},
 		ns:         "",
-		expectedStmt: `SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
+		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
   JOIN "something_fields" f ON o.key = f.key
   WHERE
     (extractBarredValue(f."spec.containers.image", "3") = ?) AND
@@ -1883,7 +3075,7 @@ func TestConstructQuery(t *testing.T) {
 SELECT key, value FROM "something_labels"
   WHERE label = ?
 )
-SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
+SELECT o.object, o.objectnonce, o.dekid FROM "something" o
   JOIN "something_fields" f ON o.key = f.key
   LEFT OUTER JOIN lt1 ON o.key = lt1.key
   WHERE
@@ -1943,6 +3135,66 @@ SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
 		expectedErr:      nil,
 	})
 
+	tests = append(tests, testCase{
+		description: "TestConstructQuery: sort on an IP-designated field does an inet_aton conversion",
+		listOptions: sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "queryField1"},
+						Order:  sqltypes.ASC,
+					},
+					{
+						Fields:   []string{"status", "podIP"},
+						Order:    sqltypes.ASC,
+						SortAsIP: true,
+					},
+				},
+			},
+		},
+		partitions: []partition.Partition{},
+		ns:         "",
+		expectedStmt: `SELECT o.object, o.objectnonce, o.dekid FROM "something" o
+  JOIN "something_fields" f ON o.key = f.key
+  WHERE
+    (FALSE)
+  ORDER BY f."metadata.queryField1" ASC, inet_aton(f."status.podIP") ASC`,
+		expectedStmtArgs: []any{},
+		expectedErr:      nil,
+	})
+
+	tests = append(tests, testCase{
+		description: "TestConstructQuery: sort can ip-convert a label field",
+		listOptions: sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "labels", "this"},
+						Order:  sqltypes.ASC,
+					},
+					{
+						Fields: []string{"status", "queryField2"},
+						Order:  sqltypes.DESC,
+					},
+				},
+			},
+		},
+		partitions: []partition.Partition{},
+		ns:         "",
+		expectedStmt: `WITH lt1(key, value) AS (
+SELECT key, value FROM "something_labels"
+  WHERE label = ?
+)
+SELECT o.object, o.objectnonce, o.dekid FROM "something" o
+  JOIN "something_fields" f ON o.key = f.key
+  LEFT OUTER JOIN lt1 ON o.key = lt1.key
+  WHERE
+    (FALSE)
+  ORDER BY lt1.value ASC NULLS LAST, f."status.queryField2" DESC`,
+		expectedStmtArgs: []any{"this"},
+		expectedErr:      nil,
+	})
+
 	t.Parallel()
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
@@ -1952,7 +3204,10 @@ SELECT DISTINCT o.object, o.objectnonce, o.dekid FROM "something" o
 			}
 			lii := &ListOptionIndexer{
 				Indexer:       i,
-				indexedFields: []string{"metadata.queryField1", "status.queryField2", "spec.containers.image"},
+				indexedFields: []string{"metadata.name", "metadata.queryField1", "status.queryField2", "spec.containers.image", "status.podIP", "metadata.namespace"},
+			}
+			if test.description == "TestConstructQuery: handles ProjectOrNamespaces NOT IN" {
+				fmt.Println("stop here")
 			}
 			queryInfo, err := lii.constructQuery(&test.listOptions, test.partitions, test.ns, "something")
 			if test.expectedErr != nil {
@@ -2036,6 +3291,7 @@ func TestBuildSortLabelsClause(t *testing.T) {
 		labelName                 string
 		joinTableIndexByLabelName map[string]int
 		direction                 bool
+		sortAsIP                  bool
 		expectedStmt              string
 		expectedErr               string
 	}
@@ -2060,10 +3316,18 @@ func TestBuildSortLabelsClause(t *testing.T) {
 		direction:                 false,
 		expectedStmt:              `lt4.value DESC NULLS FIRST`,
 	})
+	tests = append(tests, testCase{
+		description:               "TestBuildSortClause: hit descending",
+		labelName:                 "testBSL3",
+		joinTableIndexByLabelName: map[string]int{"testBSL3": 5},
+		direction:                 false,
+		sortAsIP:                  true,
+		expectedStmt:              `inet_aton(lt5.value) DESC NULLS FIRST`,
+	})
 	t.Parallel()
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
-			stmt, err := buildSortLabelsClause(test.labelName, test.joinTableIndexByLabelName, test.direction)
+			stmt, err := buildSortLabelsClause(test.labelName, test.joinTableIndexByLabelName, test.direction, test.sortAsIP)
 			if test.expectedErr != "" {
 				assert.Equal(t, test.expectedErr, err.Error())
 			} else {
@@ -2236,6 +3500,7 @@ func TestGetField(t *testing.T) {
 
 func TestWatchEncryption(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	gvk := corev1.SchemeGroupVersion.WithKind("Pod")
 
 	opts := ListOptionIndexerOptions{
 		Fields: [][]string{
@@ -2246,7 +3511,7 @@ func TestWatchEncryption(t *testing.T) {
 		IsNamespaced: true,
 	}
 	// shouldEncrypt = true to ensure we can write + read from encrypted events
-	loi, dbPath, err := makeListOptionIndexer(ctx, opts, true)
+	loi, dbPath, err := makeListOptionIndexer(ctx, gvk, opts, true, emptyNamespaceList)
 	defer cleanTempFiles(dbPath)
 	assert.NoError(t, err)
 
@@ -2260,6 +3525,7 @@ func TestWatchEncryption(t *testing.T) {
 			},
 		},
 	}
+	foo.SetGroupVersionKind(gvk)
 	foo.SetResourceVersion("100")
 	foo2 := foo.DeepCopy()
 	foo2.SetResourceVersion("120")
@@ -2323,6 +3589,7 @@ func TestWatchEncryption(t *testing.T) {
 
 func TestWatchMany(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	gvk := corev1.SchemeGroupVersion.WithKind("Pod")
 
 	opts := ListOptionIndexerOptions{
 		Fields: [][]string{
@@ -2332,7 +3599,7 @@ func TestWatchMany(t *testing.T) {
 		},
 		IsNamespaced: true,
 	}
-	loi, dbPath, err := makeListOptionIndexer(ctx, opts, false)
+	loi, dbPath, err := makeListOptionIndexer(ctx, gvk, opts, false, emptyNamespaceList)
 	defer cleanTempFiles(dbPath)
 	assert.NoError(t, err)
 
@@ -2383,6 +3650,7 @@ func TestWatchMany(t *testing.T) {
 			},
 		},
 	}
+	foo.SetGroupVersionKind(gvk)
 	foo.SetResourceVersion("100")
 	foo2 := foo.DeepCopy()
 	foo2.SetResourceVersion("120")
@@ -2452,6 +3720,7 @@ func TestWatchMany(t *testing.T) {
 }
 
 func TestWatchFilter(t *testing.T) {
+	gvk := corev1.SchemeGroupVersion.WithKind("TestKind")
 	startWatcher := func(ctx context.Context, loi *ListOptionIndexer, filter WatchFilter) (chan watch.Event, chan error) {
 		errCh := make(chan error, 1)
 		eventsCh := make(chan watch.Event, 100)
@@ -2486,6 +3755,7 @@ func TestWatchFilter(t *testing.T) {
 	}
 
 	foo := &unstructured.Unstructured{}
+	foo.SetGroupVersionKind(gvk)
 	foo.SetName("foo")
 	foo.SetNamespace("foo")
 	foo.SetLabels(map[string]string{
@@ -2498,6 +3768,7 @@ func TestWatchFilter(t *testing.T) {
 	})
 
 	bar := &unstructured.Unstructured{}
+	bar.SetGroupVersionKind(gvk)
 	bar.SetName("bar")
 	bar.SetNamespace("bar")
 	bar.SetLabels(map[string]string{
@@ -2589,7 +3860,7 @@ func TestWatchFilter(t *testing.T) {
 				Fields:       [][]string{{"metadata", "somefield"}},
 				IsNamespaced: true,
 			}
-			loi, dbPath, err := makeListOptionIndexer(ctx, opts, false)
+			loi, dbPath, err := makeListOptionIndexer(ctx, gvk, opts, false, emptyNamespaceList)
 			defer cleanTempFiles(dbPath)
 			assert.NoError(t, err)
 
@@ -2615,6 +3886,7 @@ func TestWatchFilter(t *testing.T) {
 }
 
 func TestWatchResourceVersion(t *testing.T) {
+	gvk := corev1.SchemeGroupVersion.WithKind("ConfigMap")
 	startWatcher := func(ctx context.Context, loi *ListOptionIndexer, rv string) (chan watch.Event, chan error) {
 		errCh := make(chan error, 1)
 		eventsCh := make(chan watch.Event, 100)
@@ -2649,9 +3921,11 @@ func TestWatchResourceVersion(t *testing.T) {
 	}
 
 	foo := &unstructured.Unstructured{}
+	foo.SetGroupVersionKind(gvk)
 	foo.SetResourceVersion("100")
 	foo.SetName("foo")
 	foo.SetNamespace("foo")
+	foo.Object["id"] = "foo/foo"
 	foo.SetLabels(map[string]string{
 		"app": "foo",
 	})
@@ -2663,9 +3937,11 @@ func TestWatchResourceVersion(t *testing.T) {
 	})
 
 	bar := &unstructured.Unstructured{}
+	bar.SetGroupVersionKind(gvk)
 	bar.SetResourceVersion("150")
 	bar.SetName("bar")
 	bar.SetNamespace("bar")
+	bar.Object["id"] = "bar/bar"
 	bar.SetLabels(map[string]string{
 		"app": "bar",
 	})
@@ -2681,7 +3957,7 @@ func TestWatchResourceVersion(t *testing.T) {
 	opts := ListOptionIndexerOptions{
 		IsNamespaced: true,
 	}
-	loi, dbPath, err := makeListOptionIndexer(parentCtx, opts, false)
+	loi, dbPath, err := makeListOptionIndexer(parentCtx, gvk, opts, false, emptyNamespaceList)
 	defer cleanTempFiles(dbPath)
 	assert.NoError(t, err)
 
@@ -2779,6 +4055,7 @@ func TestWatchResourceVersion(t *testing.T) {
 }
 
 func TestWatchGarbageCollection(t *testing.T) {
+	gvk := corev1.SchemeGroupVersion.WithKind("TestKind")
 	startWatcher := func(ctx context.Context, loi *ListOptionIndexer, rv string) (chan watch.Event, chan error) {
 		errCh := make(chan error, 1)
 		eventsCh := make(chan watch.Event, 100)
@@ -2813,6 +4090,7 @@ func TestWatchGarbageCollection(t *testing.T) {
 	}
 
 	foo := &unstructured.Unstructured{}
+	foo.SetGroupVersionKind(gvk)
 	foo.SetResourceVersion("100")
 	foo.SetName("foo")
 
@@ -2820,6 +4098,7 @@ func TestWatchGarbageCollection(t *testing.T) {
 	fooUpdated.SetResourceVersion("120")
 
 	bar := &unstructured.Unstructured{}
+	bar.SetGroupVersionKind(gvk)
 	bar.SetResourceVersion("150")
 	bar.SetName("bar")
 
@@ -2835,7 +4114,7 @@ func TestWatchGarbageCollection(t *testing.T) {
 		GCInterval:  40 * time.Millisecond,
 		GCKeepCount: 2,
 	}
-	loi, dbPath, err := makeListOptionIndexer(parentCtx, opts, false)
+	loi, dbPath, err := makeListOptionIndexer(parentCtx, gvk, opts, false, emptyNamespaceList)
 	defer cleanTempFiles(dbPath)
 	assert.NoError(t, err)
 
@@ -2941,12 +4220,13 @@ func TestWatchGarbageCollection(t *testing.T) {
 
 func TestNonNumberResourceVersion(t *testing.T) {
 	ctx := context.Background()
+	gvk := corev1.SchemeGroupVersion.WithKind("TestKind")
 
 	opts := ListOptionIndexerOptions{
 		Fields:       [][]string{{"metadata", "somefield"}},
 		IsNamespaced: true,
 	}
-	loi, dbPath, err := makeListOptionIndexer(ctx, opts, false)
+	loi, dbPath, err := makeListOptionIndexer(ctx, gvk, opts, false, emptyNamespaceList)
 	defer cleanTempFiles(dbPath)
 	assert.NoError(t, err)
 
@@ -2955,8 +4235,10 @@ func TestNonNumberResourceVersion(t *testing.T) {
 			"metadata": map[string]any{
 				"name": "foo",
 			},
+			"id": "/foo",
 		},
 	}
+	foo.SetGroupVersionKind(gvk)
 	foo.SetResourceVersion("a")
 	foo2 := foo.DeepCopy()
 	foo2.SetResourceVersion("b")
@@ -2968,8 +4250,10 @@ func TestNonNumberResourceVersion(t *testing.T) {
 			"metadata": map[string]any{
 				"name": "bar",
 			},
+			"id": "/bar",
 		},
 	}
+	bar.SetGroupVersionKind(gvk)
 	bar.SetResourceVersion("c")
 	err = loi.Add(foo)
 	assert.NoError(t, err)
@@ -2987,6 +4271,134 @@ func TestNonNumberResourceVersion(t *testing.T) {
 	require.NoError(t, err)
 
 	list, _, _, err := loi.ListByOptions(ctx, &sqltypes.ListOptions{}, []partition.Partition{{All: true}}, "")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, expectedList.Items, list.Items)
+}
+
+// Test that we don't panic in case the transaction fails but stil manages to add a watcher
+func TestWatchCancel(t *testing.T) {
+	gvk := corev1.SchemeGroupVersion.WithKind("TestKind")
+	startWatcher := func(ctx context.Context, loi *ListOptionIndexer, rv string) (chan watch.Event, chan error) {
+		eventsCh := make(chan watch.Event, 1)
+		errCh := make(chan error, 1)
+		go func() {
+			watchErr := loi.Watch(ctx, WatchOptions{ResourceVersion: rv}, eventsCh)
+			errCh <- watchErr
+			close(eventsCh)
+		}()
+		time.Sleep(100 * time.Millisecond)
+		return eventsCh, errCh
+	}
+
+	ctx := context.Background()
+
+	opts := ListOptionIndexerOptions{
+		Fields:       [][]string{{"metadata", "somefield"}},
+		IsNamespaced: true,
+	}
+	loi, dbPath, err := makeListOptionIndexer(ctx, gvk, opts, false, emptyNamespaceList)
+	defer cleanTempFiles(dbPath)
+	assert.NoError(t, err)
+
+	foo := &unstructured.Unstructured{
+		Object: map[string]any{
+			"metadata": map[string]any{
+				"name": "foo",
+			},
+		},
+	}
+	foo.SetGroupVersionKind(gvk)
+	foo.SetResourceVersion("100")
+
+	foo2 := foo.DeepCopy()
+	foo2.SetResourceVersion("200")
+
+	foo3 := foo.DeepCopy()
+	foo3.SetResourceVersion("300")
+
+	err = loi.Add(foo)
+	assert.NoError(t, err)
+	loi.Add(foo2)
+	assert.NoError(t, err)
+	loi.Add(foo3)
+	assert.NoError(t, err)
+
+	watchCtx, watchCancel := context.WithCancel(ctx)
+
+	eventsCh, errCh := startWatcher(watchCtx, loi, "100")
+
+	<-eventsCh
+
+	watchCancel()
+
+	<-eventsCh
+
+	go func() {
+		foo4 := foo.DeepCopy()
+		foo4.SetResourceVersion("400")
+		loi.Add(foo4)
+	}()
+	<-errCh
+	time.Sleep(1 * time.Second)
+}
+
+func Test_watcherWithBackfill(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+
+	eventsCh := make(chan int, 10)
+	w, doneCb, closeWatcher := watcherWithBackfill(ctx, eventsCh, 100)
+	defer closeWatcher()
+
+	eventsCh <- 1
+	eventsCh <- 2
+	w <- 5
+	eventsCh <- 3
+	w <- 6
+	eventsCh <- 4
+	doneCb()
+
+	time.Sleep(10 * time.Millisecond)
+	w <- 7
+	w <- 8
+
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+
+	close(eventsCh)
+	res := make([]int, 0, len(eventsCh))
+	for n := range eventsCh {
+		res = append(res, n)
+	}
+
+	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8}, res)
+}
+
+// This test aims to detect a very specific race condition, see https://github.com/rancher/steve/pull/879 for details
+func Test_watcherWithBackfillCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+
+	eventsCh := make(chan int)
+	w, doneCb, closeWatcher := watcherWithBackfill(ctx, eventsCh, 100)
+	defer closeWatcher()
+	doneCb()
+
+	select {
+	case w <- 1:
+		t.Fatal("expected blocking trying to write")
+	default:
+	}
+
+	doneWriting := make(chan struct{})
+	go func() {
+		w <- 1 // should be discarded
+		close(doneWriting)
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	cancel()
+	select {
+	case <-doneWriting:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected writing to not block when context is canceled")
+	}
 }

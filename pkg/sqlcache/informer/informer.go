@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/cache"
@@ -49,6 +50,8 @@ type ByOptionsLister interface {
 	ListByOptions(ctx context.Context, lo *sqltypes.ListOptions, partitions []partition.Partition, namespace string) (*unstructured.UnstructuredList, int, string, error)
 	Watch(ctx context.Context, options WatchOptions, eventsCh chan<- watch.Event) error
 	GetLatestResourceVersion() []string
+	RunGC(context.Context)
+	DropAll(context.Context) error
 }
 
 // this is set to a var so that it can be overridden by test code for mocking purposes
@@ -56,7 +59,8 @@ var newInformer = cache.NewSharedIndexInformer
 
 // NewInformer returns a new SQLite-backed Informer for the type specified by schema in unstructured.Unstructured form
 // using the specified client
-func NewInformer(ctx context.Context, client dynamic.ResourceInterface, fields [][]string, externalUpdateInfo *sqltypes.ExternalGVKUpdates, selfUpdateInfo *sqltypes.ExternalGVKUpdates, transform cache.TransformFunc, gvk schema.GroupVersionKind, db db.Client, shouldEncrypt bool, namespaced bool, watchable bool, gcInterval time.Duration, gcKeepCount int) (*Informer, error) {
+func NewInformer(ctx context.Context, client dynamic.ResourceInterface, fields [][]string, externalUpdateInfo *sqltypes.ExternalGVKUpdates, selfUpdateInfo *sqltypes.ExternalGVKUpdates, transform cache.TransformFunc, gvk schema.GroupVersionKind, db db.Client, shouldEncrypt bool,
+	typeGuidance map[string]string, namespaced bool, watchable bool, gcInterval time.Duration, gcKeepCount int) (*Informer, error) {
 	watchFunc := func(options metav1.ListOptions) (watch.Interface, error) {
 		return client.Watch(ctx, options)
 	}
@@ -104,6 +108,8 @@ func NewInformer(ctx context.Context, client dynamic.ResourceInterface, fields [
 	// We therefore just disable it right away.
 	resyncPeriod := time.Duration(0)
 
+	// In non-test mode `newInformer` is cache.NewSharedIndexInformer
+	// defined in k8s.io/client-go/tools/cache/shared_informer.go : func NewSharedIndexInformer(lw ...
 	sii := newInformer(listWatcher, example, resyncPeriod, cache.Indexers{})
 	if transform != nil {
 		if err := sii.SetTransform(transform); err != nil {
@@ -120,6 +126,7 @@ func NewInformer(ctx context.Context, client dynamic.ResourceInterface, fields [
 
 	opts := ListOptionIndexerOptions{
 		Fields:       fields,
+		TypeGuidance: typeGuidance,
 		IsNamespaced: namespaced,
 		GCInterval:   gcInterval,
 		GCKeepCount:  gcKeepCount,
@@ -136,6 +143,22 @@ func NewInformer(ctx context.Context, client dynamic.ResourceInterface, fields [
 		SharedIndexInformer: sii,
 		ByOptionsLister:     loi,
 	}, nil
+}
+
+// Run implements [cache.SharedIndexInformer]
+func (i *Informer) Run(stopCh <-chan struct{}) {
+	var wg wait.Group
+	wg.StartWithChannel(stopCh, i.SharedIndexInformer.Run)
+	wg.StartWithContext(wait.ContextForChannel(stopCh), i.ByOptionsLister.RunGC)
+	wg.Wait()
+}
+
+// RunWithContext implements [cache.SharedIndexInformer]
+func (i *Informer) RunWithContext(ctx context.Context) {
+	var wg wait.Group
+	wg.StartWithContext(ctx, i.SharedIndexInformer.RunWithContext)
+	wg.StartWithContext(ctx, i.ByOptionsLister.RunGC)
+	wg.Wait()
 }
 
 // ListByOptions returns objects according to the specified list options and partitions.

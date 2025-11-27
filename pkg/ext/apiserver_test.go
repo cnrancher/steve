@@ -888,7 +888,7 @@ func TestCustomColumns(t *testing.T) {
 					{
 						Cells: []any{"foo", "0001-01-01T00:00:00Z"},
 						Object: runtime.RawExtension{
-							Raw: []byte(`{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1","metadata":{"name":"foo","creationTimestamp":null}}`),
+							Raw: []byte(`{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1","metadata":{"name":"foo"}}`),
 						},
 					},
 				},
@@ -916,7 +916,7 @@ func TestCustomColumns(t *testing.T) {
 					{
 						Cells: []any{"the name is foo", "the foo value", "the bar value"},
 						Object: runtime.RawExtension{
-							Raw: []byte(`{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1","metadata":{"name":"foo","creationTimestamp":null}}`),
+							Raw: []byte(`{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1","metadata":{"name":"foo"}}`),
 						},
 					},
 				},
@@ -965,7 +965,7 @@ func TestCustomColumns(t *testing.T) {
 					{
 						Cells: []any{"the name is foo", "the foo value", "the bar value"},
 						Object: runtime.RawExtension{
-							Raw: []byte(`{"kind":"TestType","apiVersion":"ext.cattle.io/v1","metadata":{"name":"foo","creationTimestamp":null}}`),
+							Raw: []byte(`{"kind":"TestType","apiVersion":"ext.cattle.io/v1","metadata":{"name":"foo"}}`),
 						},
 					},
 				},
@@ -997,4 +997,80 @@ func TestCustomColumns(t *testing.T) {
 		})
 	}
 
+}
+
+func TestStoreEncoding(t *testing.T) {
+	scheme := runtime.NewScheme()
+	AddToScheme(scheme)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", ":0")
+	require.NoError(t, err)
+
+	store := newDefaultTestStore()
+	store.items = make(map[string]*TestType)
+
+	extensionAPIServer, err := setupExtensionAPIServer(t, scheme, store, func(opts *ExtensionAPIServerOptions) {
+		opts.Listener = ln
+		opts.Authorizer = authorizer.AuthorizerFunc(authzAllowAll)
+		opts.Authenticator = authenticator.RequestFunc(authAsAdmin)
+	}, nil)
+	require.NoError(t, err)
+
+	ts := httptest.NewServer(extensionAPIServer)
+	defer ts.Close()
+
+	createRequest := func(method string, path string, accept string) *http.Request {
+		req := httptest.NewRequest(method, path, nil)
+		req.Header.Add("Accept", accept)
+		return req
+	}
+
+	tests := []struct {
+		name                string
+		request             *http.Request
+		expectedStatusCode  int
+		expectedContentType string
+	}{
+		{
+			name:                "application/json",
+			request:             createRequest(http.MethodGet, "/apis/ext.cattle.io/v1/testtypes", "application/json"),
+			expectedStatusCode:  http.StatusOK,
+			expectedContentType: "application/json",
+		},
+		{
+			name:                "application/yaml",
+			request:             createRequest(http.MethodGet, "/apis/ext.cattle.io/v1/testtypes", "application/yaml"),
+			expectedStatusCode:  http.StatusOK,
+			expectedContentType: "application/yaml",
+		},
+		{
+			name:                "application/vnd.kubernetes.protobuf",
+			request:             createRequest(http.MethodGet, "/apis/ext.cattle.io/v1/testtypes", "application/vnd.kubernetes.protobuf"),
+			expectedStatusCode:  http.StatusNotAcceptable,
+			expectedContentType: "application/vnd.kubernetes.protobuf",
+		},
+		{
+			name:                "fallback to application/json",
+			request:             createRequest(http.MethodGet, "/apis/ext.cattle.io/v1/testtypes", "application/vnd.kubernetes.protobuf, application/json"),
+			expectedStatusCode:  http.StatusOK,
+			expectedContentType: "application/json",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := test.request
+			w := httptest.NewRecorder()
+
+			extensionAPIServer.ServeHTTP(w, req)
+
+			resp := w.Result()
+			defer resp.Body.Close()
+
+			require.Equal(t, test.expectedStatusCode, resp.StatusCode)
+			require.Equal(t, test.expectedContentType, resp.Header.Get("Content-Type"))
+		})
+	}
 }

@@ -2,7 +2,6 @@ package informer
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"testing"
 	"time"
@@ -30,20 +29,21 @@ func TestNewInformer(t *testing.T) {
 	}
 
 	var tests []testCase
+	nilTypeGuidance := map[string]string{}
 
 	tests = append(tests, testCase{description: "NewInformer() with no errors returned, should return no error", test: func(t *testing.T) {
-		dbClient := NewMockClient(gomock.NewController(t))
-		txClient := NewMockTXClient(gomock.NewController(t))
-		dynamicClient := NewMockResourceInterface(gomock.NewController(t))
+		ctrl := gomock.NewController(t)
+		dbClient := NewMockClient(ctrl)
+		txClient := NewMockTxClient(ctrl)
+		dynamicClient := NewMockResourceInterface(ctrl)
+		stmt := NewMockStmt(ctrl)
 
 		fields := [][]string{{"something"}}
 		gvk := schema.GroupVersionKind{}
 
 		// NewStore() from store package logic. This package is only concerned with whether it returns err or not as NewStore
 		// is tested in depth in its own package.
-		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
-		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
-		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
+		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil).Times(3)
 		dbClient.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(nil).Do(
 			func(ctx context.Context, shouldEncrypt bool, f db.WithTransactionFunction) {
 				err := f(txClient)
@@ -51,7 +51,7 @@ func TestNewInformer(t *testing.T) {
 					t.Fail()
 				}
 			})
-		dbClient.EXPECT().Prepare(gomock.Any()).Return(&sql.Stmt{}).AnyTimes()
+		dbClient.EXPECT().Prepare(gomock.Any()).Return(stmt).AnyTimes()
 
 		// NewIndexer() logic (within NewListOptionIndexer(). This test is only concerned with whether it returns err or not as NewIndexer
 		// is tested in depth in its own indexer_test.go
@@ -81,14 +81,14 @@ func TestNewInformer(t *testing.T) {
 				}
 			})
 
-		informer, err := NewInformer(context.Background(), dynamicClient, fields, nil, nil, nil, gvk, dbClient, false, true, true, 0, 0)
+		informer, err := NewInformer(context.Background(), dynamicClient, fields, nil, nil, nil, gvk, dbClient, false, nilTypeGuidance, true, true, 0, 0)
 		assert.Nil(t, err)
 		assert.NotNil(t, informer.ByOptionsLister)
 		assert.NotNil(t, informer.SharedIndexInformer)
 	}})
 	tests = append(tests, testCase{description: "NewInformer() with errors returned from NewStore(), should return an error", test: func(t *testing.T) {
 		dbClient := NewMockClient(gomock.NewController(t))
-		txClient := NewMockTXClient(gomock.NewController(t))
+		txClient := NewMockTxClient(gomock.NewController(t))
 		dynamicClient := NewMockResourceInterface(gomock.NewController(t))
 
 		fields := [][]string{{"something"}}
@@ -105,13 +105,15 @@ func TestNewInformer(t *testing.T) {
 				}
 			})
 
-		_, err := NewInformer(context.Background(), dynamicClient, fields, nil, nil, nil, gvk, dbClient, false, true, true, 0, 0)
+		_, err := NewInformer(context.Background(), dynamicClient, fields, nil, nil, nil, gvk, dbClient, false, nilTypeGuidance, true, true, 0, 0)
 		assert.NotNil(t, err)
 	}})
 	tests = append(tests, testCase{description: "NewInformer() with errors returned from NewIndexer(), should return an error", test: func(t *testing.T) {
-		dbClient := NewMockClient(gomock.NewController(t))
-		txClient := NewMockTXClient(gomock.NewController(t))
-		dynamicClient := NewMockResourceInterface(gomock.NewController(t))
+		ctrl := gomock.NewController(t)
+		dbClient := NewMockClient(ctrl)
+		txClient := NewMockTxClient(ctrl)
+		dynamicClient := NewMockResourceInterface(ctrl)
+		stmt := NewMockStmt(ctrl)
 
 		fields := [][]string{{"something"}}
 		gvk := schema.GroupVersionKind{}
@@ -127,7 +129,7 @@ func TestNewInformer(t *testing.T) {
 					t.Fail()
 				}
 			})
-		dbClient.EXPECT().Prepare(gomock.Any()).Return(&sql.Stmt{}).AnyTimes()
+		dbClient.EXPECT().Prepare(gomock.Any()).Return(stmt).AnyTimes()
 
 		// NewIndexer() logic (within NewListOptionIndexer(). This test is only concerned with whether it returns err or not as NewIndexer
 		// is tested in depth in its own indexer_test.go
@@ -140,13 +142,15 @@ func TestNewInformer(t *testing.T) {
 				}
 			})
 
-		_, err := NewInformer(context.Background(), dynamicClient, fields, nil, nil, nil, gvk, dbClient, false, true, true, 0, 0)
+		_, err := NewInformer(context.Background(), dynamicClient, fields, nil, nil, nil, gvk, dbClient, false, nilTypeGuidance, true, true, 0, 0)
 		assert.NotNil(t, err)
 	}})
 	tests = append(tests, testCase{description: "NewInformer() with errors returned from NewListOptionIndexer(), should return an error", test: func(t *testing.T) {
-		dbClient := NewMockClient(gomock.NewController(t))
-		txClient := NewMockTXClient(gomock.NewController(t))
-		dynamicClient := NewMockResourceInterface(gomock.NewController(t))
+		ctrl := gomock.NewController(t)
+		dbClient := NewMockClient(ctrl)
+		txClient := NewMockTxClient(ctrl)
+		dynamicClient := NewMockResourceInterface(ctrl)
+		stmt := NewMockStmt(ctrl)
 
 		fields := [][]string{{"something"}}
 		gvk := schema.GroupVersionKind{}
@@ -163,7 +167,7 @@ func TestNewInformer(t *testing.T) {
 					t.Fail()
 				}
 			})
-		dbClient.EXPECT().Prepare(gomock.Any()).Return(&sql.Stmt{}).AnyTimes()
+		dbClient.EXPECT().Prepare(gomock.Any()).Return(stmt).AnyTimes()
 
 		// NewIndexer() logic (within NewListOptionIndexer(). This test is only concerned with whether it returns err or not as NewIndexer
 		// is tested in depth in its own indexer_test.go
@@ -193,13 +197,15 @@ func TestNewInformer(t *testing.T) {
 				}
 			})
 
-		_, err := NewInformer(context.Background(), dynamicClient, fields, nil, nil, nil, gvk, dbClient, false, true, true, 0, 0)
+		_, err := NewInformer(context.Background(), dynamicClient, fields, nil, nil, nil, gvk, dbClient, false, nilTypeGuidance, true, true, 0, 0)
 		assert.NotNil(t, err)
 	}})
 	tests = append(tests, testCase{description: "NewInformer() with transform func", test: func(t *testing.T) {
-		dbClient := NewMockClient(gomock.NewController(t))
-		txClient := NewMockTXClient(gomock.NewController(t))
-		dynamicClient := NewMockResourceInterface(gomock.NewController(t))
+		ctrl := gomock.NewController(t)
+		dbClient := NewMockClient(ctrl)
+		txClient := NewMockTxClient(ctrl)
+		dynamicClient := NewMockResourceInterface(ctrl)
+		stmt := NewMockStmt(ctrl)
 		mockInformer := mockInformer{}
 		testNewInformer := func(lw cache.ListerWatcher,
 			exampleObject runtime.Object,
@@ -224,7 +230,7 @@ func TestNewInformer(t *testing.T) {
 					t.Fail()
 				}
 			})
-		dbClient.EXPECT().Prepare(gomock.Any()).Return(&sql.Stmt{}).AnyTimes()
+		dbClient.EXPECT().Prepare(gomock.Any()).Return(stmt).AnyTimes()
 
 		// NewIndexer() logic (within NewListOptionIndexer(). This test is only concerned with whether it returns err or not as NewIndexer
 		// is tested in depth in its own indexer_test.go
@@ -257,7 +263,7 @@ func TestNewInformer(t *testing.T) {
 		transformFunc := func(input interface{}) (interface{}, error) {
 			return "someoutput", nil
 		}
-		informer, err := NewInformer(context.Background(), dynamicClient, fields, nil, nil, transformFunc, gvk, dbClient, false, true, true, 0, 0)
+		informer, err := NewInformer(context.Background(), dynamicClient, fields, nil, nil, transformFunc, gvk, dbClient, false, nilTypeGuidance, true, true, 0, 0)
 		assert.Nil(t, err)
 		assert.NotNil(t, informer.ByOptionsLister)
 		assert.NotNil(t, informer.SharedIndexInformer)
@@ -293,7 +299,7 @@ func TestNewInformer(t *testing.T) {
 		transformFunc := func(input interface{}) (interface{}, error) {
 			return "someoutput", nil
 		}
-		_, err := NewInformer(context.Background(), dynamicClient, fields, nil, nil, transformFunc, gvk, dbClient, false, true, true, 0, 0)
+		_, err := NewInformer(context.Background(), dynamicClient, fields, nil, nil, transformFunc, gvk, dbClient, false, nilTypeGuidance, true, true, 0, 0)
 		assert.Error(t, err)
 		newInformer = cache.NewSharedIndexInformer
 	}})

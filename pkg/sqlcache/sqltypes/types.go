@@ -27,9 +27,11 @@ const (
 
 // ListOptions represents the query parameters that may be included in a list request.
 type ListOptions struct {
-	Filters    []OrFilter
-	SortList   SortList
-	Pagination Pagination
+	Filters              []OrFilter
+	ProjectsOrNamespaces OrFilter
+	SortList             SortList
+	Pagination           Pagination
+	Revision             string
 }
 
 // Filter represents a field to filter by.
@@ -57,8 +59,9 @@ type OrFilter struct {
 // The order is represented by prefixing the sort key by '-', e.g. sort=-metadata.name.
 // e.g. To sort internal clusters first followed by clusters in alpha order: sort=-spec.internal,spec.displayName
 type Sort struct {
-	Fields []string
-	Order  SortOrder
+	Fields   []string
+	Order    SortOrder
+	SortAsIP bool
 }
 
 type SortList struct {
