@@ -127,6 +127,7 @@ func TestNewListOptionIndexer(t *testing.T) {
 		store.EXPECT().GetName().Return(id).AnyTimes()
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
+		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(nil).Do(
 			func(ctx context.Context, shouldEncrypt bool, f db.WithTransactionFunction) {
 				err := f(txClient)
@@ -146,14 +147,18 @@ func TestNewListOptionIndexer(t *testing.T) {
 		store.EXPECT().RegisterBeforeDropAll(gomock.Any()).AnyTimes()
 
 		// create events table
+		txClient.EXPECT().Exec(fmt.Sprintf(dropEventsFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createEventsTableFmt, id)).Return(nil, nil)
 		// create field table
+		txClient.EXPECT().Exec(fmt.Sprintf(dropFieldsFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" INT`)).Return(nil, nil)
 		// create field table indexes
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.name", id, "metadata.name")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.namespace", id, "metadata.namespace")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.creationTimestamp", id, "metadata.creationTimestamp")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, fields[0][0], id, fields[0][0])).Return(nil, nil)
+		// create labels table
+		txClient.EXPECT().Exec(fmt.Sprintf(dropLabelsStmtFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createLabelsTableFmt, id, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createLabelsTableIndexFmt, id, id)).Return(nil, nil)
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(nil).Do(
@@ -182,6 +187,7 @@ func TestNewListOptionIndexer(t *testing.T) {
 		store.EXPECT().GetName().Return(id).AnyTimes()
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
+		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(fmt.Errorf("error")).Do(
 			func(ctx context.Context, shouldEncrypt bool, f db.WithTransactionFunction) {
 				err := f(txClient)
@@ -205,6 +211,7 @@ func TestNewListOptionIndexer(t *testing.T) {
 		id := "somename"
 		// logic for NewIndexer(), only interested in if this results in error or not
 		store.EXPECT().GetName().Return(id).AnyTimes()
+		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(nil).Do(
@@ -244,6 +251,7 @@ func TestNewListOptionIndexer(t *testing.T) {
 		store.EXPECT().GetName().Return(id).AnyTimes()
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
+		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(nil).Do(
 			func(ctx context.Context, shouldEncrypt bool, f db.WithTransactionFunction) {
 				err := f(txClient)
@@ -262,7 +270,9 @@ func TestNewListOptionIndexer(t *testing.T) {
 		store.EXPECT().RegisterAfterDeleteAll(gomock.Any()).Times(2)
 		store.EXPECT().RegisterBeforeDropAll(gomock.Any()).AnyTimes()
 
+		txClient.EXPECT().Exec(fmt.Sprintf(dropEventsFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createEventsTableFmt, id)).Return(nil, nil)
+		txClient.EXPECT().Exec(fmt.Sprintf(dropFieldsFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.name", id, "metadata.name")).Return(nil, fmt.Errorf("error"))
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(fmt.Errorf("error")).Do(
@@ -291,6 +301,7 @@ func TestNewListOptionIndexer(t *testing.T) {
 		store.EXPECT().GetName().Return(id).AnyTimes()
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
+		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(nil).Do(
 			func(ctx context.Context, shouldEncrypt bool, f db.WithTransactionFunction) {
 				err := f(txClient)
@@ -309,12 +320,15 @@ func TestNewListOptionIndexer(t *testing.T) {
 		store.EXPECT().RegisterAfterDeleteAll(gomock.Any()).Times(2)
 		store.EXPECT().RegisterBeforeDropAll(gomock.Any()).AnyTimes()
 
+		txClient.EXPECT().Exec(fmt.Sprintf(dropEventsFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createEventsTableFmt, id)).Return(nil, nil)
+		txClient.EXPECT().Exec(fmt.Sprintf(dropFieldsFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.name", id, "metadata.name")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.namespace", id, "metadata.namespace")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.creationTimestamp", id, "metadata.creationTimestamp")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, fields[0][0], id, fields[0][0])).Return(nil, nil)
+		txClient.EXPECT().Exec(fmt.Sprintf(dropLabelsStmtFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createLabelsTableFmt, id, id)).Return(nil, fmt.Errorf("error"))
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(fmt.Errorf("error")).Do(
 			func(ctx context.Context, shouldEncrypt bool, f db.WithTransactionFunction) {
@@ -342,6 +356,7 @@ func TestNewListOptionIndexer(t *testing.T) {
 		store.EXPECT().GetName().Return(id).AnyTimes()
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
 		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
+		txClient.EXPECT().Exec(gomock.Any()).Return(nil, nil)
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(nil).Do(
 			func(ctx context.Context, shouldEncrypt bool, f db.WithTransactionFunction) {
 				err := f(txClient)
@@ -360,12 +375,15 @@ func TestNewListOptionIndexer(t *testing.T) {
 		store.EXPECT().RegisterAfterDeleteAll(gomock.Any()).Times(2)
 		store.EXPECT().RegisterBeforeDropAll(gomock.Any()).AnyTimes()
 
+		txClient.EXPECT().Exec(fmt.Sprintf(dropEventsFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createEventsTableFmt, id)).Return(nil, nil)
+		txClient.EXPECT().Exec(fmt.Sprintf(dropFieldsFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsTableFmt, id, id, `"metadata.name" TEXT, "metadata.creationTimestamp" TEXT, "metadata.namespace" TEXT, "something" TEXT`)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.name", id, "metadata.name")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.namespace", id, "metadata.namespace")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, "metadata.creationTimestamp", id, "metadata.creationTimestamp")).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createFieldsIndexFmt, id, fields[0][0], id, fields[0][0])).Return(nil, nil)
+		txClient.EXPECT().Exec(fmt.Sprintf(dropLabelsStmtFmt, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createLabelsTableFmt, id, id)).Return(nil, nil)
 		txClient.EXPECT().Exec(fmt.Sprintf(createLabelsTableIndexFmt, id, id)).Return(nil, nil)
 		store.EXPECT().WithTransaction(gomock.Any(), true, gomock.Any()).Return(fmt.Errorf("error")).Do(
@@ -1512,8 +1530,8 @@ func TestNewListOptionIndexerTypeGuidance(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
 			loi, dbPath, err := makeListOptionIndexer(t.Context(), gvk, test.opts, false, namespaceList)
-			defer cleanTempFiles(dbPath)
 			require.NoError(t, err)
+			defer cleanTempFiles(dbPath)
 
 			for _, item := range itemList.Items {
 				err = loi.Add(&item)
@@ -1549,6 +1567,261 @@ func TestNewListOptionIndexerTypeGuidance(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, len(allObjects), total)
 			assert.Equal(t, expectedList, list)
+		})
+	}
+}
+
+// Tests to verify we can sort on say pods on `spec.containers.image[i]`
+func TestSortPodsOnArrayAccess(t *testing.T) {
+	ctx := context.Background()
+	podGVK := schema.GroupVersionKind{
+		Group:   "",
+		Version: "v1",
+		Kind:    "Pod",
+	}
+	make_pod_obj := func(name, image1, image2 string) map[string]any {
+		containers := make(map[string]any)
+		if image2 != "" {
+			containers["image"] = image1 + "|" + image2
+		} else {
+			containers["image"] = image1
+		}
+		return map[string]any{
+			"metadata": map[string]any{
+				"name":      name,
+				"namespace": "ns-a",
+			},
+			"spec": map[string]any{
+				"containers": containers,
+			},
+		}
+	}
+	canoe_twix_ritter := make_pod_obj("canoe", "twix", "ritter")
+	catamaran_flake_none := make_pod_obj("catamaran", "flake", "")
+	clipper_butterfinger_payday := make_pod_obj("clipper", "butterfinger", "payday")
+	ferry_twix_yorkie := make_pod_obj("ferry", "twix", "yorkie")
+	hydrofoil_coffeecrisp_ritter := make_pod_obj("hydrofoil", "coffeecrisp", "ritter")
+	kayak_butterfinger_rocher := make_pod_obj("kayak", "butterfinger", "rocher")
+	raft_almondjoy_ragusa := make_pod_obj("raft", "almondjoy", "ragusa")
+	schooner_twix_mounds := make_pod_obj("schooner", "twix", "mounds")
+	sloop_snickers_toblerone := make_pod_obj("sloop", "snickers", "toblerone")
+	trawler_butterfinger_aero := make_pod_obj("trawler", "butterfinger", "aero")
+
+	allObjects := []map[string]any{
+		canoe_twix_ritter,
+		catamaran_flake_none,
+		clipper_butterfinger_payday,
+		ferry_twix_yorkie,
+		hydrofoil_coffeecrisp_ritter,
+		kayak_butterfinger_rocher,
+		raft_almondjoy_ragusa,
+		schooner_twix_mounds,
+		sloop_snickers_toblerone,
+		trawler_butterfinger_aero,
+	}
+	ns_a := map[string]any{
+		"metadata": map[string]any{
+			"name": "ns-a",
+		},
+	}
+	ns_b := map[string]any{
+		"metadata": map[string]any{
+			"name": "ns-b",
+		},
+	}
+
+	itemList := makeList(t, allObjects...)
+	namespaceList := makeList(t, ns_a, ns_b)
+	fields := [][]string{
+		{"spec", "containers", "image"},
+	}
+
+	type testCase struct {
+		description   string
+		listOptions   sqltypes.ListOptions
+		expectedList  *unstructured.UnstructuredList
+		expectedTotal int
+	}
+
+	tests := make([]testCase, 0)
+	tests = append(tests, testCase{
+		description: "can select for a specific first image",
+		listOptions: sqltypes.ListOptions{
+			Filters: []sqltypes.OrFilter{
+				{
+					[]sqltypes.Filter{
+						{
+							Field:   []string{"spec", "containers", "image", "0"},
+							Matches: []string{"butterfinger"},
+							Op:      sqltypes.Eq,
+						},
+					},
+				},
+			},
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "name"},
+						Order:  sqltypes.ASC,
+					},
+				},
+			},
+		},
+		expectedList:  makeList(t, clipper_butterfinger_payday, kayak_butterfinger_rocher, trawler_butterfinger_aero),
+		expectedTotal: 3,
+	})
+	tests = append(tests, testCase{
+		description: "can select for a specific second image",
+		listOptions: sqltypes.ListOptions{
+			Filters: []sqltypes.OrFilter{
+				{
+					[]sqltypes.Filter{
+						{
+							Field:   []string{"spec", "containers", "image", "1"},
+							Matches: []string{"toblerone"},
+							Op:      sqltypes.Eq,
+						},
+					},
+				},
+			},
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "name"},
+						Order:  sqltypes.ASC,
+					},
+				},
+			},
+		},
+		expectedList:  makeList(t, sloop_snickers_toblerone),
+		expectedTotal: 1,
+	})
+	tests = append(tests, testCase{
+		description: "can sort on the first image",
+		listOptions: sqltypes.ListOptions{
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"spec", "containers", "image", "0"},
+						Order:  sqltypes.ASC,
+					},
+					{
+						Fields: []string{"metadata", "name"},
+						Order:  sqltypes.ASC,
+					},
+				},
+			},
+		},
+		expectedList: makeList(t,
+			raft_almondjoy_ragusa,
+			clipper_butterfinger_payday,
+			kayak_butterfinger_rocher,
+			trawler_butterfinger_aero,
+			hydrofoil_coffeecrisp_ritter,
+			catamaran_flake_none,
+			sloop_snickers_toblerone,
+			canoe_twix_ritter,
+			ferry_twix_yorkie,
+			schooner_twix_mounds,
+		),
+		expectedTotal: len(allObjects),
+	})
+	tests = append(tests, testCase{
+		description: "can select for any second image",
+		listOptions: sqltypes.ListOptions{
+			Filters: []sqltypes.OrFilter{
+				{
+					[]sqltypes.Filter{
+						{
+							Field:   []string{"spec", "containers", "image", "1"},
+							Matches: []string{""},
+							Op:      sqltypes.NotEq,
+						},
+					},
+				},
+			},
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"metadata", "name"},
+						Order:  sqltypes.ASC,
+					},
+				},
+			},
+		},
+		expectedList: makeList(t, canoe_twix_ritter,
+			clipper_butterfinger_payday,
+			ferry_twix_yorkie,
+			hydrofoil_coffeecrisp_ritter,
+			kayak_butterfinger_rocher,
+			raft_almondjoy_ragusa,
+			schooner_twix_mounds,
+			sloop_snickers_toblerone,
+			trawler_butterfinger_aero,
+		),
+		expectedTotal: 9,
+	})
+	tests = append(tests, testCase{
+		description: "can sort on the second image (when present)",
+		listOptions: sqltypes.ListOptions{
+			Filters: []sqltypes.OrFilter{
+				{
+					[]sqltypes.Filter{
+						{
+							Field:   []string{"spec", "containers", "image", "1"},
+							Matches: []string{""},
+							Op:      sqltypes.NotEq,
+						},
+					},
+				},
+			},
+			SortList: sqltypes.SortList{
+				SortDirectives: []sqltypes.Sort{
+					{
+						Fields: []string{"spec", "containers", "image", "1"},
+						Order:  sqltypes.ASC,
+					},
+					{
+						Fields: []string{"metadata", "name"},
+						Order:  sqltypes.ASC,
+					},
+				},
+			},
+		},
+		expectedList: makeList(t,
+			trawler_butterfinger_aero,
+			schooner_twix_mounds,
+			clipper_butterfinger_payday,
+			raft_almondjoy_ragusa,
+			canoe_twix_ritter,
+			hydrofoil_coffeecrisp_ritter,
+			kayak_butterfinger_rocher,
+			sloop_snickers_toblerone,
+			ferry_twix_yorkie,
+		),
+		expectedTotal: 9,
+	})
+
+	t.Parallel()
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			opts := ListOptionIndexerOptions{
+				Fields:       fields,
+				IsNamespaced: true,
+			}
+			loi, dbPath, err := makeListOptionIndexer(ctx, podGVK, opts, false, namespaceList)
+			require.NoError(t, err)
+			defer cleanTempFiles(dbPath)
+
+			for _, item := range itemList.Items {
+				err = loi.Add(&item)
+				require.NoError(t, err)
+			}
+			list, total, _, err := loi.ListByOptions(ctx, &test.listOptions, []partition.Partition{{All: true}}, "")
+			require.NoError(t, err)
+
+			assert.Equal(t, test.expectedTotal, total)
+			assert.Equal(t, test.expectedList, list)
 		})
 	}
 }
