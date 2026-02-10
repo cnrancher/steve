@@ -149,6 +149,11 @@ type ListOptionIndexerOptions struct {
 	//
 	// For example, .metadata.resourceVersion should be specified as []string{"metadata", "resourceVersion"}
 	Fields [][]string
+	// Used for specifying types of non-TEXT database fields.
+	// The key is a fully-qualified field name, like 'metadata.fields[1]'.
+	// The value is a type name, most likely "INT" but could be "REAL". The default type is "TEXT",
+	// and we don't (currently) use NULL or BLOB types.
+	TypeGuidance map[string]string
 	// IsNamespaced determines whether the GVK for this ListOptionIndexer is
 	// namespaced
 	IsNamespaced bool
@@ -203,20 +208,37 @@ func NewListOptionIndexer(ctx context.Context, s Store, opts ListOptionIndexerOp
 	l.RegisterBeforeDropAll(l.dropFields)
 	columnDefs := make([]string, len(indexedFields))
 	for index, field := range indexedFields {
-		column := fmt.Sprintf(`"%s" TEXT`, field)
+		typeName := "TEXT"
+		newTypeName, ok := opts.TypeGuidance[field]
+		if ok {
+			typeName = newTypeName
+		}
+		column := fmt.Sprintf(`"%s" %s`, field, typeName)
 		columnDefs[index] = column
 	}
 
 	dbName := db.Sanitize(i.GetName())
-	columns := make([]string, len(indexedFields))
-	qmarks := make([]string, len(indexedFields))
-	setStatements := make([]string, len(indexedFields))
+	columns := make([]string, 0, len(indexedFields))
+	qmarks := make([]string, 0, len(indexedFields))
+	setStatements := make([]string, 0, len(indexedFields))
 
 	err = l.WithTransaction(ctx, true, func(tx transaction.Client) error {
+		dropEventsQuery := fmt.Sprintf(dropEventsFmt, dbName)
+		_, err = tx.Exec(dropEventsQuery)
+		if err != nil {
+			return &db.QueryError{QueryString: dropEventsQuery, Err: err}
+		}
+
 		createEventsTableQuery := fmt.Sprintf(createEventsTableFmt, dbName)
 		_, err = tx.Exec(createEventsTableQuery)
 		if err != nil {
-			return &db.QueryError{QueryString: createEventsTableFmt, Err: err}
+			return &db.QueryError{QueryString: createEventsTableQuery, Err: err}
+		}
+
+		dropFieldsQuery := fmt.Sprintf(dropFieldsFmt, dbName)
+		_, err = tx.Exec(dropFieldsQuery)
+		if err != nil {
+			return &db.QueryError{QueryString: dropFieldsQuery, Err: err}
 		}
 
 		createFieldsTableQuery := fmt.Sprintf(createFieldsTableFmt, dbName, strings.Join(columnDefs, ", "))
@@ -225,7 +247,7 @@ func NewListOptionIndexer(ctx context.Context, s Store, opts ListOptionIndexerOp
 			return &db.QueryError{QueryString: createFieldsTableQuery, Err: err}
 		}
 
-		for index, field := range indexedFields {
+		for _, field := range indexedFields {
 			// create index for field
 			createFieldsIndexQuery := fmt.Sprintf(createFieldsIndexFmt, dbName, field, dbName, field)
 			_, err = tx.Exec(createFieldsIndexQuery)
@@ -235,15 +257,22 @@ func NewListOptionIndexer(ctx context.Context, s Store, opts ListOptionIndexerOp
 
 			// format field into column for prepared statement
 			column := fmt.Sprintf(`"%s"`, field)
-			columns[index] = column
+			columns = append(columns, column)
 
 			// add placeholder for column's value in prepared statement
-			qmarks[index] = "?"
+			qmarks = append(qmarks, "?")
 
 			// add formatted set statement for prepared statement
 			setStatement := fmt.Sprintf(`"%s" = excluded."%s"`, field, field)
-			setStatements[index] = setStatement
+			setStatements = append(setStatements, setStatement)
 		}
+
+		dropLabelsQuery := fmt.Sprintf(dropLabelsStmtFmt, dbName)
+		_, err = tx.Exec(dropLabelsQuery)
+		if err != nil {
+			return &db.QueryError{QueryString: dropLabelsQuery, Err: err}
+		}
+
 		createLabelsTableQuery := fmt.Sprintf(createLabelsTableFmt, dbName, dbName)
 		_, err = tx.Exec(createLabelsTableQuery)
 		if err != nil {
@@ -344,23 +373,32 @@ func (l *ListOptionIndexer) Watch(ctx context.Context, opts WatchOptions, events
 	}
 
 	if err := l.WithTransaction(ctx, false, func(tx transaction.Client) error {
-		rowIDRow := tx.Stmt(l.findEventsRowByRVStmt).QueryRowContext(ctx, targetRV)
-		if err := rowIDRow.Err(); err != nil {
-			return &db.QueryError{QueryString: l.findEventsRowByRVQuery, Err: err}
-		}
-
 		var rowID int
-		err := rowIDRow.Scan(&rowID)
-		if errors.Is(err, sql.ErrNoRows) {
-			if targetRV != latestRV {
-				return ErrTooOld
+		// use a closure to ensure rows is always closed immediately after it's needed
+		if err := func() error {
+			rows, err := l.QueryForRows(ctx, tx.Stmt(l.findEventsRowByRVStmt), targetRV)
+			if err != nil {
+				return &db.QueryError{QueryString: l.findEventsRowByRVQuery, Err: err}
 			}
-		} else if err != nil {
-			return fmt.Errorf("failed scan rowid: %w", err)
+			defer rows.Close()
+
+			if !rows.Next() {
+				// query returned no results
+				if targetRV != latestRV {
+					return ErrTooOld
+				}
+				return nil
+			}
+			if err := rows.Scan(&rowID); err != nil {
+				return fmt.Errorf("failed scan rowid: %w", err)
+			}
+			return nil
+		}(); err != nil {
+			return err
 		}
 
 		// Backfilling previous events from resourceVersion
-		rows, err := tx.Stmt(l.listEventsAfterStmt).QueryContext(ctx, rowID)
+		rows, err := l.QueryForRows(ctx, tx.Stmt(l.listEventsAfterStmt), rowID)
 		if err != nil {
 			return &db.QueryError{QueryString: l.listEventsAfterQuery, Err: err}
 		}
@@ -392,9 +430,14 @@ func (l *ListOptionIndexer) Watch(ctx context.Context, opts WatchOptions, events
 			if !matchFilter(filter.ID, filter.Namespace, filter.Selector, obj) {
 				continue
 			}
-			eventsCh <- watch.Event{
+			ev := watch.Event{
 				Type:   typ,
 				Object: obj,
+			}
+			select {
+			case eventsCh <- ev:
+			case <-ctx.Done():
+				return ctx.Err()
 			}
 		}
 		return rows.Err()
@@ -1008,9 +1051,8 @@ func (l *ListOptionIndexer) executeQuery(ctx context.Context, queryInfo *QueryIn
 
 	var items []any
 	err = l.WithTransaction(ctx, false, func(tx transaction.Client) error {
-		txStmt := tx.Stmt(stmt)
 		now := time.Now()
-		rows, err := txStmt.QueryContext(ctx, queryInfo.params...)
+		rows, err := l.QueryForRows(ctx, tx.Stmt(stmt), queryInfo.params...)
 		if err != nil {
 			return &db.QueryError{QueryString: queryInfo.query, Err: err}
 		}
@@ -1030,9 +1072,8 @@ func (l *ListOptionIndexer) executeQuery(ctx context.Context, queryInfo *QueryIn
 					err = errors.Join(err, &db.QueryError{QueryString: queryInfo.countQuery, Err: cerr})
 				}
 			}()
-			txStmt := tx.Stmt(countStmt)
 			now = time.Now()
-			rows, err := txStmt.QueryContext(ctx, queryInfo.countParams...)
+			rows, err := l.QueryForRows(ctx, tx.Stmt(countStmt), queryInfo.countParams...)
 			if err != nil {
 				return &db.QueryError{QueryString: queryInfo.countQuery, Err: err}
 			}
