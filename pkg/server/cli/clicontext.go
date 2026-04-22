@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"time"
 
 	steveauth "github.com/rancher/steve/pkg/auth"
 	authcli "github.com/rancher/steve/pkg/auth/cli"
@@ -20,6 +19,9 @@ type Config struct {
 	HTTPSListenPort int
 	HTTPListenPort  int
 	UIPath          string
+
+	PprofEnabled    bool
+	PprofListenAddr string
 
 	WebhookConfig authcli.WebhookConfig
 }
@@ -55,7 +57,6 @@ func (c *Config) ToServer(ctx context.Context, sqlCache bool) (*server.Server, e
 		Next:           ui.New(c.UIPath),
 		SQLCache:       sqlCache,
 		SQLCacheFactoryOptions: factory.CacheFactoryOptions{
-			GCInterval:  15 * time.Minute,
 			GCKeepCount: 1000,
 		},
 	})
@@ -86,6 +87,16 @@ func Flags(config *Config) []cli.Flag {
 			Name:        "http-listen-port",
 			Value:       9080,
 			Destination: &config.HTTPListenPort,
+		},
+		&cli.BoolFlag{
+			Name:        "enable-pprof",
+			Value:       false,
+			Destination: &config.PprofEnabled,
+		},
+		&cli.StringFlag{
+			Name:        "pprof-listen-addr",
+			Value:       "localhost:6060",
+			Destination: &config.PprofListenAddr,
 		},
 	}
 

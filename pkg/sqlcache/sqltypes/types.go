@@ -5,14 +5,16 @@ import "k8s.io/apimachinery/pkg/runtime/schema"
 type Op string
 
 const (
-	Eq        Op = "="
-	NotEq     Op = "!="
-	Exists    Op = "Exists"
-	NotExists Op = "NotExists"
-	In        Op = "In"
-	NotIn     Op = "NotIn"
-	Lt        Op = "Lt"
-	Gt        Op = "Gt"
+	Eq          Op = "="
+	NotEq       Op = "!="
+	Exists      Op = "Exists"
+	NotExists   Op = "NotExists"
+	In          Op = "In"
+	NotIn       Op = "NotIn"
+	Contains    Op = "Contains"
+	NotContains Op = "NotContains"
+	Lt          Op = "Lt"
+	Gt          Op = "Gt"
 )
 
 // SortOrder represents whether the list should be ascending or descending.
@@ -27,11 +29,13 @@ const (
 
 // ListOptions represents the query parameters that may be included in a list request.
 type ListOptions struct {
-	Filters              []OrFilter
-	ProjectsOrNamespaces OrFilter
-	SortList             SortList
-	Pagination           Pagination
-	Revision             string
+	Filters               []OrFilter
+	ProjectsOrNamespaces  OrFilter
+	SortList              SortList
+	SummaryFieldList      SummaryFieldList
+	Pagination            Pagination
+	IncludeAssociatedData bool
+	Revision              string
 }
 
 // Filter represents a field to filter by.
@@ -67,6 +71,8 @@ type Sort struct {
 type SortList struct {
 	SortDirectives []Sort
 }
+
+type SummaryFieldList [][]string
 
 // Pagination represents how to return paginated results.
 type Pagination struct {

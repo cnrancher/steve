@@ -13,10 +13,13 @@ import (
 	context "context"
 	reflect "reflect"
 
+	types "github.com/rancher/apiserver/pkg/types"
+	accesscontrol "github.com/rancher/steve/pkg/accesscontrol"
 	partition "github.com/rancher/steve/pkg/sqlcache/partition"
 	sqltypes "github.com/rancher/steve/pkg/sqlcache/sqltypes"
 	gomock "go.uber.org/mock/gomock"
 	unstructured "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // MockCache is a mock of Cache interface.
@@ -43,15 +46,30 @@ func (m *MockCache) EXPECT() *MockCacheMockRecorder {
 	return m.recorder
 }
 
+// AugmentList mocks base method.
+func (m *MockCache) AugmentList(ctx context.Context, list *unstructured.UnstructuredList, childGVK schema.GroupVersionKind, childSchemaName string, useSelectors bool, accessList accesscontrol.AccessListByVerb) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AugmentList", ctx, list, childGVK, childSchemaName, useSelectors, accessList)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// AugmentList indicates an expected call of AugmentList.
+func (mr *MockCacheMockRecorder) AugmentList(ctx, list, childGVK, childSchemaName, useSelectors, accessList any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AugmentList", reflect.TypeOf((*MockCache)(nil).AugmentList), ctx, list, childGVK, childSchemaName, useSelectors, accessList)
+}
+
 // ListByOptions mocks base method.
-func (m *MockCache) ListByOptions(ctx context.Context, lo *sqltypes.ListOptions, partitions []partition.Partition, namespace string) (*unstructured.UnstructuredList, int, string, error) {
+func (m *MockCache) ListByOptions(ctx context.Context, lo *sqltypes.ListOptions, partitions []partition.Partition, namespace string) (*unstructured.UnstructuredList, int, *types.APISummary, string, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "ListByOptions", ctx, lo, partitions, namespace)
 	ret0, _ := ret[0].(*unstructured.UnstructuredList)
 	ret1, _ := ret[1].(int)
-	ret2, _ := ret[2].(string)
-	ret3, _ := ret[3].(error)
-	return ret0, ret1, ret2, ret3
+	ret2, _ := ret[2].(*types.APISummary)
+	ret3, _ := ret[3].(string)
+	ret4, _ := ret[4].(error)
+	return ret0, ret1, ret2, ret3, ret4
 }
 
 // ListByOptions indicates an expected call of ListByOptions.

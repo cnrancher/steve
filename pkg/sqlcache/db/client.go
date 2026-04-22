@@ -18,6 +18,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 
 	// needed for drivers
 	_ "modernc.org/sqlite"
@@ -40,6 +42,8 @@ const (
 
 	informerObjectCachePerms fs.FileMode = 0o600
 
+	maxBeginTXAttemptsOnBusyErrors = 3
+
 	debugQueryLogPathEnvVar           = "CATTLE_DEBUG_QUERY_LOG"
 	debugQueryIncludeParamsPathEnvVar = "CATTLE_DEBUG_QUERY_INCLUDE_PARAMS"
 )
@@ -51,8 +55,9 @@ type Client interface {
 	QueryForRows(ctx context.Context, stmt Stmt, params ...any) (Rows, error)
 	ReadObjects(rows Rows, typ reflect.Type) ([]any, error)
 	ReadStrings(rows Rows) ([]string, error)
-	ReadStrings2(rows Rows) ([][]string, error)
+	ReadStringsN(rows Rows, numColumns int) ([][]string, error)
 	ReadInt(rows Rows) (int, error)
+	ReadStringIntString(rows Rows) ([][]string, error)
 	Upsert(tx TxClient, stmt Stmt, key string, obj SerializedObject) error
 	NewConnection(isTemp bool) (string, error)
 	Serialize(obj any, encrypt bool) (SerializedObject, error)
@@ -80,38 +85,68 @@ func (c *client) WithTransaction(ctx context.Context, forWriting bool, f WithTra
 func (c *client) withTransaction(ctx context.Context, forWriting bool, f WithTransactionFunction) error {
 	c.connLock.RLock()
 	// note: this assumes _txlock=immediate in the connection string, see NewConnection
-	tx, err := c.conn.BeginTx(ctx, &sql.TxOptions{
-		ReadOnly: !forWriting,
-	})
+	tx, err := c.beginTX(ctx, forWriting)
 	c.connLock.RUnlock()
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 
-	if err = f(NewTxClient(tx, WithQueryLogger(c.queryLogger))); err != nil {
+	if err := f(NewTxClient(tx, WithQueryLogger(c.queryLogger))); err != nil {
 		rerr := c.rollback(ctx, tx)
 		return errors.Join(err, rerr)
 	}
 
-	err = c.commit(ctx, tx)
-	if err != nil {
-		// When the context.Context given to BeginTx is canceled, then the
-		// Tx is rolled back already, so rolling back again could have failed.
-		return err
-	}
-	return nil
+	return c.commit(ctx, tx)
 }
 
-func (c *client) commit(ctx context.Context, tx *sql.Tx) error {
+// beginTX handles automatic retries for writing transactions for specific error codes.
+// Rationale: in WAL mode, BEGIN IMMEDIATE requires 2 steps: create a read transaction and promote it, which can fail if another thread wrote to the database in the meantime.
+// See https://github.com/rancher/rancher/issues/52872 for more details
+func (c *client) beginTX(ctx context.Context, forWriting bool) (Tx, error) {
+	if !forWriting {
+		return c.conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	}
+
+	var attempts int
+	for {
+		attempts++
+		tx, err := c.conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: false})
+		if err == nil {
+			return tx, nil
+		} else if attempts == maxBeginTXAttemptsOnBusyErrors || !isRetriableSQLiteError(err) {
+			return nil, err
+		}
+	}
+}
+
+func isRetriableSQLiteError(err error) bool {
+	var serr *sqlite.Error
+	if !errors.As(err, &serr) {
+		return false
+	}
+
+	switch serr.Code() {
+	case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_BUSY_SNAPSHOT:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *client) commit(ctx context.Context, tx Tx) error {
 	err := tx.Commit()
+	// When the context.Context given to BeginTx is canceled, then the
+	// Tx is rolled back automatically, so rolling back again could have failed.
 	if errors.Is(err, sql.ErrTxDone) && ctx.Err() == context.Canceled {
 		return fmt.Errorf("commit failed due to canceled context")
 	}
 	return err
 }
 
-func (c *client) rollback(ctx context.Context, tx *sql.Tx) error {
+func (c *client) rollback(ctx context.Context, tx Tx) error {
 	err := tx.Rollback()
+	// When the context.Context given to BeginTx is canceled, then the
+	// Tx is rolled back automatically, so rolling back again could have failed.
 	if errors.Is(err, sql.ErrTxDone) && ctx.Err() == context.Canceled {
 		return fmt.Errorf("rollback failed due to canceled context")
 	}
@@ -134,10 +169,18 @@ type client struct {
 
 // Connection represents a connection pool.
 type Connection interface {
-	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (Tx, error)
 	Exec(query string, args ...any) (sql.Result, error)
 	Prepare(query string) (*sql.Stmt, error)
 	Close() error
+}
+
+type connection struct {
+	*sql.DB
+}
+
+func (c *connection) BeginTx(ctx context.Context, opts *sql.TxOptions) (Tx, error) {
+	return c.DB.BeginTx(ctx, opts)
 }
 
 // QueryError encapsulates an error while executing a query
@@ -280,20 +323,55 @@ func (c *client) ReadStrings(rows Rows) ([]string, error) {
 	return result, nil
 }
 
-// ReadStrings2 scans the given rows into pairs of strings, and then returns the strings as a slice.
-func (c *client) ReadStrings2(rows Rows) ([][]string, error) {
+// ReadStringIntString scans the given rows into (string, int, string) tuples, and then returns a slice of them.
+func (c *client) ReadStringIntString(rows Rows) ([][]string, error) {
 	c.connLock.RLock()
 	defer c.connLock.RUnlock()
 
 	var result [][]string
 	for rows.Next() {
-		var key1, key2 string
-		err := rows.Scan(&key1, &key2)
+		var val1 string
+		var val2 int
+		var val3 string
+		err := rows.Scan(&val1, &val2, &val3)
 		if err != nil {
 			return nil, closeRowsOnError(rows, err)
 		}
 
-		result = append(result, []string{key1, key2})
+		result = append(result, []string{val1, strconv.Itoa(val2), val3})
+	}
+	err := rows.Err()
+	if err != nil {
+		return nil, closeRowsOnError(rows, err)
+	}
+
+	err = rows.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// ReadStringsN scans the given rows into string-slices of the specified number of columns
+func (c *client) ReadStringsN(rows Rows, numColumns int) ([][]string, error) {
+	c.connLock.RLock()
+	defer c.connLock.RUnlock()
+
+	var result [][]string
+	stringPointers := make([]any, numColumns)
+	for rows.Next() {
+		// stringList needs be reinitialized on each iteration or all the final data in
+		// the `result` array will be the last row!
+		stringList := make([]string, numColumns)
+		for i := range stringList {
+			stringPointers[i] = &stringList[i]
+		}
+		err := rows.Scan(stringPointers...)
+		if err != nil {
+			return nil, closeRowsOnError(rows, err)
+		}
+		result = append(result, stringList)
 	}
 	err := rows.Err()
 	if err != nil {
@@ -472,9 +550,10 @@ func (c *client) NewConnection(useTempDir bool) (string, error) {
 		return dbPath, err
 	}
 	sqlite.RegisterDeterministicScalarFunction("extractBarredValue", 2, extractBarredValue)
+	sqlite.RegisterDeterministicScalarFunction("hasBarredValue", 2, hasBarredValue)
 	sqlite.RegisterDeterministicScalarFunction("inet_aton", 1, inetAtoN)
 	sqlite.RegisterDeterministicScalarFunction("memoryInBytes", 1, memoryInBytes)
-	c.conn = sqlDB
+	c.conn = &connection{sqlDB}
 	return dbPath, nil
 }
 
@@ -501,13 +580,36 @@ func extractBarredValue(ctx *sqlite.FunctionContext, args []driver.Value) (drive
 		return nil, fmt.Errorf("unsupported type for arg2: expected an int, got: %T", args[0])
 	}
 	if err != nil {
-		return nil, fmt.Errorf("problem with arg2: %w", err)
+		return nil, fmt.Errorf("extractBarredValue: problem with arg2: %w", err)
 	}
 	parts := strings.Split(arg1, "|")
 	if arg2 >= len(parts) || arg2 < 0 {
 		return "", nil
 	}
 	return parts[arg2], nil
+}
+
+func hasBarredValue(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+	var arg1 string
+	var arg2 string
+	switch argTyped := args[0].(type) {
+	case string:
+		arg1 = argTyped
+	case []byte:
+		arg1 = string(argTyped)
+	default:
+		return nil, fmt.Errorf("hasBarredValue: unsupported type for arg1: expected a string, got :%T", args[0])
+	}
+	switch argTyped := args[1].(type) {
+	case string:
+		arg2 = argTyped
+	case []byte:
+		arg2 = string(argTyped)
+	default:
+		return nil, fmt.Errorf("hasBarredValue: unsupported type for arg2: expected a string, got: %T", args[0])
+	}
+	parts := strings.Split(arg1, "|")
+	return slices.Contains(parts, arg2), nil
 }
 
 func inetAtoN(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {

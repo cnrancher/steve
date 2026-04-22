@@ -13,10 +13,13 @@ import (
 	context "context"
 	reflect "reflect"
 
+	types "github.com/rancher/apiserver/pkg/types"
+	accesscontrol "github.com/rancher/steve/pkg/accesscontrol"
 	partition "github.com/rancher/steve/pkg/sqlcache/partition"
 	sqltypes "github.com/rancher/steve/pkg/sqlcache/sqltypes"
 	gomock "go.uber.org/mock/gomock"
 	unstructured "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	watch "k8s.io/apimachinery/pkg/watch"
 )
 
@@ -42,6 +45,20 @@ func NewMockByOptionsLister(ctrl *gomock.Controller) *MockByOptionsLister {
 // EXPECT returns an object that allows the caller to indicate expected use.
 func (m *MockByOptionsLister) EXPECT() *MockByOptionsListerMockRecorder {
 	return m.recorder
+}
+
+// AugmentList mocks base method.
+func (m *MockByOptionsLister) AugmentList(ctx context.Context, list *unstructured.UnstructuredList, childGVK schema.GroupVersionKind, childSchemaName string, useSelectors bool, accessList accesscontrol.AccessListByVerb) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AugmentList", ctx, list, childGVK, childSchemaName, useSelectors, accessList)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// AugmentList indicates an expected call of AugmentList.
+func (mr *MockByOptionsListerMockRecorder) AugmentList(ctx, list, childGVK, childSchemaName, useSelectors, accessList any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AugmentList", reflect.TypeOf((*MockByOptionsLister)(nil).AugmentList), ctx, list, childGVK, childSchemaName, useSelectors, accessList)
 }
 
 // DropAll mocks base method.
@@ -73,32 +90,21 @@ func (mr *MockByOptionsListerMockRecorder) GetLatestResourceVersion() *gomock.Ca
 }
 
 // ListByOptions mocks base method.
-func (m *MockByOptionsLister) ListByOptions(ctx context.Context, lo *sqltypes.ListOptions, partitions []partition.Partition, namespace string) (*unstructured.UnstructuredList, int, string, error) {
+func (m *MockByOptionsLister) ListByOptions(ctx context.Context, lo *sqltypes.ListOptions, partitions []partition.Partition, namespace string) (*unstructured.UnstructuredList, int, *types.APISummary, string, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "ListByOptions", ctx, lo, partitions, namespace)
 	ret0, _ := ret[0].(*unstructured.UnstructuredList)
 	ret1, _ := ret[1].(int)
-	ret2, _ := ret[2].(string)
-	ret3, _ := ret[3].(error)
-	return ret0, ret1, ret2, ret3
+	ret2, _ := ret[2].(*types.APISummary)
+	ret3, _ := ret[3].(string)
+	ret4, _ := ret[4].(error)
+	return ret0, ret1, ret2, ret3, ret4
 }
 
 // ListByOptions indicates an expected call of ListByOptions.
 func (mr *MockByOptionsListerMockRecorder) ListByOptions(ctx, lo, partitions, namespace any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListByOptions", reflect.TypeOf((*MockByOptionsLister)(nil).ListByOptions), ctx, lo, partitions, namespace)
-}
-
-// RunGC mocks base method.
-func (m *MockByOptionsLister) RunGC(arg0 context.Context) {
-	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "RunGC", arg0)
-}
-
-// RunGC indicates an expected call of RunGC.
-func (mr *MockByOptionsListerMockRecorder) RunGC(arg0 any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RunGC", reflect.TypeOf((*MockByOptionsLister)(nil).RunGC), arg0)
 }
 
 // Watch mocks base method.

@@ -1,9 +1,12 @@
 package sqlproxy
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,7 +19,6 @@ import (
 	"github.com/rancher/steve/pkg/attributes"
 	"github.com/rancher/steve/pkg/client"
 	"github.com/rancher/steve/pkg/resources/common"
-	"github.com/rancher/steve/pkg/schema/table"
 	"github.com/rancher/steve/pkg/sqlcache/informer"
 	"github.com/rancher/steve/pkg/sqlcache/informer/factory"
 	"github.com/rancher/steve/pkg/sqlcache/partition"
@@ -25,11 +27,11 @@ import (
 	"github.com/rancher/steve/pkg/stores/sqlproxy/tablelistconvert"
 	"github.com/rancher/wrangler/v3/pkg/schemas"
 	"github.com/rancher/wrangler/v3/pkg/schemas/validation"
+	"github.com/stretchr/testify/assert"
 
 	"go.uber.org/mock/gomock"
 
 	//"github.com/pkg/errors"
-	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	schema2 "k8s.io/apimachinery/pkg/runtime/schema"
+	apitypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/authentication/user"
 	krequest "k8s.io/apiserver/pkg/endpoints/request"
@@ -46,9 +49,9 @@ import (
 	clientgotesting "k8s.io/client-go/testing"
 )
 
-//go:generate mockgen --build_flags=--mod=mod -package sqlproxy -destination ./proxy_mocks_test.go github.com/rancher/steve/pkg/stores/sqlproxy Cache,ClientGetter,CacheFactory,SchemaColumnSetter,RelationshipNotifier,TransformBuilder
-//go:generate mockgen --build_flags=--mod=mod -package sqlproxy -destination ./sql_informer_mocks_test.go github.com/rancher/steve/pkg/sqlcache/informer ByOptionsLister
-//go:generate mockgen --build_flags=--mod=mod -package sqlproxy -destination ./dynamic_mocks_test.go k8s.io/client-go/dynamic ResourceInterface
+//go:generate go tool -modfile ../../../gotools/mockgen/go.mod mockgen --build_flags=--mod=mod -package sqlproxy -destination ./proxy_mocks_test.go github.com/rancher/steve/pkg/stores/sqlproxy Cache,ClientGetter,CacheFactory,SchemaColumnSetter,RelationshipNotifier,TransformBuilder,SchemaCollection
+//go:generate go tool -modfile ../../../gotools/mockgen/go.mod mockgen --build_flags=--mod=mod -package sqlproxy -destination ./sql_informer_mocks_test.go github.com/rancher/steve/pkg/sqlcache/informer ByOptionsLister
+//go:generate go tool -modfile ../../../gotools/mockgen/go.mod mockgen --build_flags=--mod=mod -package sqlproxy -destination ./dynamic_mocks_test.go k8s.io/client-go/dynamic ResourceInterface
 
 var c *watch.FakeWatcher
 
@@ -71,7 +74,6 @@ func TestNewProxyStore(t *testing.T) {
 		description string
 		test        func(t *testing.T)
 	}
-	noTypeGuidance := map[string]string{}
 	var tests []testCase
 	tests = append(tests, testCase{
 		description: "NewProxyStore() with no errors returned should return no errors. Should initialize and assign" +
@@ -89,20 +91,39 @@ func TestNewProxyStore(t *testing.T) {
 				},
 			}
 
-			nsSchema := baseNSSchema
-			scc.EXPECT().SetColumns(context.Background(), &nsSchema).Return(nil)
-			cg.EXPECT().TableAdminClient(nil, &nsSchema, "", &WarningBuffer{}).Return(ri, nil)
+			nsSchema := &types.APISchema{
+				Schema: &schemas.Schema{
+					Attributes: map[string]interface{}{
+						"group":    "",
+						"version":  "v1",
+						"kind":     "Namespace",
+						"resource": "namespaces",
+					},
+				},
+			}
+			sc := NewMockSchemaCollection(gomock.NewController(t))
+			sc.EXPECT().ByGVK(attributes.GVK(nsSchema)).Return("namespace")
+			sc.EXPECT().Schema("namespace").Return(nsSchema)
+
+			scc.EXPECT().SetColumns(context.Background(), nsSchema).Return(nil)
+			cg.EXPECT().TableAdminClient(nil, nsSchema, "", &WarningBuffer{}).Return(ri, nil)
+			idField := &informer.JSONPathField{Path: []string{"id"}}
+			stateField := &informer.JSONPathField{Path: []string{"metadata", "state", "name"}}
+			displayField := &informer.JSONPathField{Path: []string{"spec", "displayName"}}
 			cf.EXPECT().CacheFor(context.Background(),
-				[][]string{{`id`}, {`metadata`, `state`, `name`}, {"spec", "displayName"}},
+				map[string]informer.IndexedField{
+					idField.ColumnName():      idField,
+					stateField.ColumnName():   stateField,
+					displayField.ColumnName(): displayField,
+				},
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
 				&tablelistconvert.Client{ResourceInterface: ri},
-				attributes.GVK(&nsSchema),
-				noTypeGuidance,
+				attributes.GVK(nsSchema),
 				false,
 				true).Return(c, nil)
-			s, err := NewProxyStore(context.Background(), scc, cg, rn, nil, cf, true)
+			s, err := NewProxyStore(context.Background(), scc, cg, rn, nil, sc, cf, true)
 			assert.Nil(t, err)
 			assert.Equal(t, scc, s.columnSetter)
 			assert.Equal(t, cg, s.clientGetter)
@@ -118,8 +139,9 @@ func TestNewProxyStore(t *testing.T) {
 			scc := NewMockSchemaColumnSetter(gomock.NewController(t))
 			cg := NewMockClientGetter(gomock.NewController(t))
 			rn := NewMockRelationshipNotifier(gomock.NewController(t))
+			sc := NewMockSchemaCollection(gomock.NewController(t))
 			cf := NewMockCacheFactory(gomock.NewController(t))
-			s, err := NewProxyStore(context.Background(), scc, cg, rn, nil, cf, false)
+			s, err := NewProxyStore(context.Background(), scc, cg, rn, nil, sc, cf, false)
 			assert.Nil(t, err)
 			assert.Equal(t, scc, s.columnSetter)
 			assert.Equal(t, cg, s.clientGetter)
@@ -137,10 +159,23 @@ func TestNewProxyStore(t *testing.T) {
 			rn := NewMockRelationshipNotifier(gomock.NewController(t))
 			cf := NewMockCacheFactory(gomock.NewController(t))
 
-			nsSchema := baseNSSchema
-			scc.EXPECT().SetColumns(context.Background(), &nsSchema).Return(fmt.Errorf("error"))
+			nsSchema := &types.APISchema{
+				Schema: &schemas.Schema{
+					Attributes: map[string]interface{}{
+						"group":    "",
+						"version":  "v1",
+						"kind":     "Namespace",
+						"resource": "namespaces",
+					},
+				},
+			}
+			sc := NewMockSchemaCollection(gomock.NewController(t))
+			sc.EXPECT().ByGVK(attributes.GVK(nsSchema)).Return("namespace")
+			sc.EXPECT().Schema("namespace").Return(nsSchema)
 
-			s, err := NewProxyStore(context.Background(), scc, cg, rn, nil, cf, true)
+			scc.EXPECT().SetColumns(context.Background(), nsSchema).Return(fmt.Errorf("error"))
+
+			s, err := NewProxyStore(context.Background(), scc, cg, rn, nil, sc, cf, true)
 			assert.Nil(t, err)
 			assert.Equal(t, scc, s.columnSetter)
 			assert.Equal(t, cg, s.clientGetter)
@@ -158,11 +193,24 @@ func TestNewProxyStore(t *testing.T) {
 			rn := NewMockRelationshipNotifier(gomock.NewController(t))
 			cf := NewMockCacheFactory(gomock.NewController(t))
 
-			nsSchema := baseNSSchema
-			scc.EXPECT().SetColumns(context.Background(), &nsSchema).Return(nil)
-			cg.EXPECT().TableAdminClient(nil, &nsSchema, "", &WarningBuffer{}).Return(nil, fmt.Errorf("error"))
+			nsSchema := &types.APISchema{
+				Schema: &schemas.Schema{
+					Attributes: map[string]interface{}{
+						"group":    "",
+						"version":  "v1",
+						"kind":     "Namespace",
+						"resource": "namespaces",
+					},
+				},
+			}
+			sc := NewMockSchemaCollection(gomock.NewController(t))
+			sc.EXPECT().ByGVK(attributes.GVK(nsSchema)).Return("namespace")
+			sc.EXPECT().Schema("namespace").Return(nsSchema)
 
-			s, err := NewProxyStore(context.Background(), scc, cg, rn, nil, cf, true)
+			scc.EXPECT().SetColumns(context.Background(), nsSchema).Return(nil)
+			cg.EXPECT().TableAdminClient(nil, nsSchema, "", &WarningBuffer{}).Return(nil, fmt.Errorf("error"))
+
+			s, err := NewProxyStore(context.Background(), scc, cg, rn, nil, sc, cf, true)
 			assert.Nil(t, err)
 			assert.Equal(t, scc, s.columnSetter)
 			assert.Equal(t, cg, s.clientGetter)
@@ -181,21 +229,40 @@ func TestNewProxyStore(t *testing.T) {
 			cf := NewMockCacheFactory(gomock.NewController(t))
 			ri := NewMockResourceInterface(gomock.NewController(t))
 
-			nsSchema := baseNSSchema
-			scc.EXPECT().SetColumns(context.Background(), &nsSchema).Return(nil)
-			cg.EXPECT().TableAdminClient(nil, &nsSchema, "", &WarningBuffer{}).Return(ri, nil)
+			nsSchema := &types.APISchema{
+				Schema: &schemas.Schema{
+					Attributes: map[string]interface{}{
+						"group":    "",
+						"version":  "v1",
+						"kind":     "Namespace",
+						"resource": "namespaces",
+					},
+				},
+			}
+			sc := NewMockSchemaCollection(gomock.NewController(t))
+			sc.EXPECT().ByGVK(attributes.GVK(nsSchema)).Return("namespace")
+			sc.EXPECT().Schema("namespace").Return(nsSchema)
+
+			scc.EXPECT().SetColumns(context.Background(), nsSchema).Return(nil)
+			cg.EXPECT().TableAdminClient(nil, nsSchema, "", &WarningBuffer{}).Return(ri, nil)
+			idField := &informer.JSONPathField{Path: []string{"id"}}
+			stateField := &informer.JSONPathField{Path: []string{"metadata", "state", "name"}}
+			displayField := &informer.JSONPathField{Path: []string{"spec", "displayName"}}
 			cf.EXPECT().CacheFor(context.Background(),
-				[][]string{{`id`}, {`metadata`, `state`, `name`}, {"spec", "displayName"}},
+				map[string]informer.IndexedField{
+					idField.ColumnName():      idField,
+					stateField.ColumnName():   stateField,
+					displayField.ColumnName(): displayField,
+				},
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
 				&tablelistconvert.Client{ResourceInterface: ri},
-				attributes.GVK(&nsSchema),
-				noTypeGuidance,
+				attributes.GVK(nsSchema),
 				false,
 				true).Return(nil, fmt.Errorf("error"))
 
-			s, err := NewProxyStore(context.Background(), scc, cg, rn, nil, cf, true)
+			s, err := NewProxyStore(context.Background(), scc, cg, rn, nil, sc, cf, true)
 			assert.Nil(t, err)
 			assert.Equal(t, scc, s.columnSetter)
 			assert.Equal(t, cg, s.clientGetter)
@@ -227,8 +294,7 @@ func TestListByPartitions(t *testing.T) {
 	}
 	var tests []testCase
 	tests = append(tests, testCase{
-		description: "client ListByPartitions() with no errors returned should return no errors. Should pass fields" +
-			" from schema.",
+		description: "client ListByPartitions() with no errors returned should return no errors. Should pass fields from schema.",
 		test: func(t *testing.T) {
 			cg := NewMockClientGetter(gomock.NewController(t))
 			cf := NewMockCacheFactory(gomock.NewController(t))
@@ -285,7 +351,8 @@ func TestListByPartitions(t *testing.T) {
 				Version: "test",
 				Kind:    "gvk",
 			}
-			typeSpecificIndexedFields["some_test_gvk"] = [][]string{{"gvk", "specific", "fields"}}
+			gvkField := &informer.JSONPathField{Path: []string{"gvk", "specific", "fields"}}
+			TypeSpecificIndexedFields["some_test_gvk"] = map[string]informer.IndexedField{gvkField.ColumnName(): gvkField}
 
 			setupContext(req)
 			attributes.SetGVK(schema, gvk)
@@ -296,23 +363,31 @@ func TestListByPartitions(t *testing.T) {
 			assert.Nil(t, err)
 			cg.EXPECT().TableAdminClient(req, schema, "", &WarningBuffer{}).Return(ri, nil)
 			// This tests that fields are being extracted from schema columns and the type specific fields map
+			someField := &informer.JSONPathField{Path: []string{"some", "field"}}
+			idField := &informer.JSONPathField{Path: []string{"id"}}
+			stateField := &informer.JSONPathField{Path: []string{"metadata", "state", "name"}}
 			cf.EXPECT().CacheFor(gomock.Cond(isDerivedContext),
-				[][]string{{"some", "field"}, {`id`}, {`metadata`, `state`, `name`}, {"gvk", "specific", "fields"}},
+				map[string]informer.IndexedField{
+					someField.ColumnName():  someField,
+					idField.ColumnName():    idField,
+					stateField.ColumnName(): stateField,
+					gvkField.ColumnName():   gvkField,
+				},
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
 				&tablelistconvert.Client{ResourceInterface: ri},
 				attributes.GVK(schema),
-				gomock.Any(),
 				attributes.Namespaced(schema),
 				true).Return(c, nil)
 			cf.EXPECT().DoneWithCache(c)
-			tb.EXPECT().GetTransformFunc(attributes.GVK(schema), []common.ColumnDefinition{{Field: "some.field"}}, false).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
-			bloi.EXPECT().ListByOptions(gomock.Cond(isDerivedContext), &opts, partitions, req.Namespace).Return(listToReturn, len(listToReturn.Items), "", nil)
-			list, total, contToken, err := s.ListByPartitions(req, schema, partitions)
+			tb.EXPECT().GetTransformFunc(attributes.GVK(schema), []common.ColumnDefinition{{Field: "some.field"}}, false, nil).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
+			bloi.EXPECT().ListByOptions(gomock.Cond(isDerivedContext), &opts, partitions, req.Namespace).Return(listToReturn, len(listToReturn.Items), nil, "", nil)
+			list, total, summary, contToken, err := s.ListByPartitions(req, schema, partitions)
 			assert.Nil(t, err)
 			assert.Equal(t, expectedItems, list.Items)
 			assert.Equal(t, len(expectedItems), total)
+			assert.Nil(t, summary)
 			assert.Equal(t, "", contToken)
 		},
 	})
@@ -371,7 +446,8 @@ func TestListByPartitions(t *testing.T) {
 				Version: "test",
 				Kind:    "gvk",
 			}
-			typeSpecificIndexedFields["some_test_gvk"] = [][]string{{"gvk", "specific", "fields"}}
+			gvkField := &informer.JSONPathField{Path: []string{"gvk", "specific", "fields"}}
+			TypeSpecificIndexedFields["some_test_gvk"] = map[string]informer.IndexedField{gvkField.ColumnName(): gvkField}
 
 			setupContext(req)
 			attributes.SetGVK(schema, gvk)
@@ -382,7 +458,7 @@ func TestListByPartitions(t *testing.T) {
 			assert.Nil(t, err)
 			cg.EXPECT().TableAdminClient(req, schema, "", &WarningBuffer{}).Return(nil, fmt.Errorf("error"))
 
-			_, _, _, err = s.ListByPartitions(req, schema, partitions)
+			_, _, _, _, err = s.ListByPartitions(req, schema, partitions)
 			assert.NotNil(t, err)
 		},
 	})
@@ -449,7 +525,8 @@ func TestListByPartitions(t *testing.T) {
 				Version: "test",
 				Kind:    "gvk",
 			}
-			typeSpecificIndexedFields["some_test_gvk"] = [][]string{{"gvk", "specific", "fields"}}
+			gvkField := &informer.JSONPathField{Path: []string{"gvk", "specific", "fields"}}
+			TypeSpecificIndexedFields["some_test_gvk"] = map[string]informer.IndexedField{gvkField.ColumnName(): gvkField}
 
 			attributes.SetGVK(schema, gvk)
 			// ListByPartitions copies point so we need some original record of items to ensure as asserting listToReturn's
@@ -461,25 +538,33 @@ func TestListByPartitions(t *testing.T) {
 
 			// This tests that fields are being extracted from schema columns and the type specific fields map
 			// note also the watchable bool is expected to be false
+			someField := &informer.JSONPathField{Path: []string{"some", "field"}}
+			idField := &informer.JSONPathField{Path: []string{"id"}}
+			stateField := &informer.JSONPathField{Path: []string{"metadata", "state", "name"}}
 			cf.EXPECT().CacheFor(gomock.Cond(isDerivedContext),
-				[][]string{{"some", "field"}, {`id`}, {`metadata`, `state`, `name`}, {"gvk", "specific", "fields"}},
+				map[string]informer.IndexedField{
+					someField.ColumnName():  someField,
+					idField.ColumnName():    idField,
+					stateField.ColumnName(): stateField,
+					gvkField.ColumnName():   gvkField,
+				},
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
 				&tablelistconvert.Client{ResourceInterface: ri},
 				attributes.GVK(schema),
-				gomock.Any(),
 				attributes.Namespaced(schema),
 				false).Return(c, nil)
 			cf.EXPECT().DoneWithCache(c)
 
-			tb.EXPECT().GetTransformFunc(attributes.GVK(schema), []common.ColumnDefinition{{Field: "some.field"}}, false).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
-			bloi.EXPECT().ListByOptions(gomock.Cond(isDerivedContext), &opts, partitions, req.Namespace).Return(listToReturn, len(listToReturn.Items), "", nil)
-			list, total, contToken, err := s.ListByPartitions(req, schema, partitions)
+			tb.EXPECT().GetTransformFunc(attributes.GVK(schema), []common.ColumnDefinition{{Field: "some.field"}}, false, nil).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
+			bloi.EXPECT().ListByOptions(gomock.Cond(isDerivedContext), &opts, partitions, req.Namespace).Return(listToReturn, len(listToReturn.Items), nil, "", nil)
+			list, total, summary, contToken, err := s.ListByPartitions(req, schema, partitions)
 			assert.Nil(t, err)
 			assert.Equal(t, expectedItems, list.Items)
 			assert.Equal(t, len(expectedItems), total)
 			assert.Equal(t, "", contToken)
+			assert.Nil(t, summary)
 		},
 	})
 	tests = append(tests, testCase{
@@ -537,7 +622,8 @@ func TestListByPartitions(t *testing.T) {
 				Version: "test",
 				Kind:    "gvk",
 			}
-			typeSpecificIndexedFields["some_test_gvk"] = [][]string{{"gvk", "specific", "fields"}}
+			gvkField := &informer.JSONPathField{Path: []string{"gvk", "specific", "fields"}}
+			TypeSpecificIndexedFields["some_test_gvk"] = map[string]informer.IndexedField{gvkField.ColumnName(): gvkField}
 
 			setupContext(req)
 			attributes.SetGVK(schema, gvk)
@@ -548,25 +634,31 @@ func TestListByPartitions(t *testing.T) {
 			assert.Nil(t, err)
 			cg.EXPECT().TableAdminClient(req, schema, "", &WarningBuffer{}).Return(ri, nil)
 			// This tests that fields are being extracted from schema columns and the type specific fields map
-			tb.EXPECT().GetTransformFunc(attributes.GVK(schema), gomock.Any(), false).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
+			tb.EXPECT().GetTransformFunc(attributes.GVK(schema), gomock.Any(), false, nil).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
+			someField := &informer.JSONPathField{Path: []string{"some", "field"}}
+			idField := &informer.JSONPathField{Path: []string{"id"}}
+			stateField := &informer.JSONPathField{Path: []string{"metadata", "state", "name"}}
 			cf.EXPECT().CacheFor(gomock.Cond(isDerivedContext),
-				[][]string{{"some", "field"}, {`id`}, {`metadata`, `state`, `name`}, {"gvk", "specific", "fields"}},
+				map[string]informer.IndexedField{
+					someField.ColumnName():  someField,
+					idField.ColumnName():    idField,
+					stateField.ColumnName(): stateField,
+					gvkField.ColumnName():   gvkField,
+				},
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
 				&tablelistconvert.Client{ResourceInterface: ri},
 				attributes.GVK(schema),
-				gomock.Any(),
 				attributes.Namespaced(schema),
 				true).Return(nil, fmt.Errorf("error"))
 
-			_, _, _, err = s.ListByPartitions(req, schema, partitions)
+			_, _, _, _, err = s.ListByPartitions(req, schema, partitions)
 			assert.NotNil(t, err)
 		},
 	})
 	tests = append(tests, testCase{
-		description: "client ListByPartitions() with ListByOptions() error returned should return an errors. Should pass fields" +
-			" from schema.",
+		description: "client ListByPartitions() with ListByOptions() error returned should return an errors. Should pass fields from schema.",
 		test: func(t *testing.T) {
 			nsi := factory.Cache{
 				ByOptionsLister: NewMockByOptionsLister(gomock.NewController(t)),
@@ -626,7 +718,8 @@ func TestListByPartitions(t *testing.T) {
 				Version: "test",
 				Kind:    "gvk",
 			}
-			typeSpecificIndexedFields["some_test_gvk"] = [][]string{{"gvk", "specific", "fields"}}
+			gvkField := &informer.JSONPathField{Path: []string{"gvk", "specific", "fields"}}
+			TypeSpecificIndexedFields["some_test_gvk"] = map[string]informer.IndexedField{gvkField.ColumnName(): gvkField}
 
 			setupContext(req)
 			attributes.SetGVK(schema, gvk)
@@ -637,27 +730,209 @@ func TestListByPartitions(t *testing.T) {
 			assert.Nil(t, err)
 			cg.EXPECT().TableAdminClient(req, schema, "", &WarningBuffer{}).Return(ri, nil)
 			// This tests that fields are being extracted from schema columns and the type specific fields map
+			someField := &informer.JSONPathField{Path: []string{"some", "field"}}
+			idField := &informer.JSONPathField{Path: []string{"id"}}
+			stateField := &informer.JSONPathField{Path: []string{"metadata", "state", "name"}}
 			cf.EXPECT().CacheFor(gomock.Cond(isDerivedContext),
-				[][]string{{"some", "field"}, {`id`}, {`metadata`, `state`, `name`}, {"gvk", "specific", "fields"}},
+				map[string]informer.IndexedField{
+					someField.ColumnName():  someField,
+					idField.ColumnName():    idField,
+					stateField.ColumnName(): stateField,
+					gvkField.ColumnName():   gvkField,
+				},
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
 				&tablelistconvert.Client{ResourceInterface: ri},
 				attributes.GVK(schema),
-				gomock.Any(),
 				attributes.Namespaced(schema),
 				true).Return(c, nil)
 			cf.EXPECT().DoneWithCache(c)
-			bloi.EXPECT().ListByOptions(gomock.Cond(isDerivedContext), &opts, partitions, req.Namespace).Return(nil, 0, "", fmt.Errorf("error"))
-			tb.EXPECT().GetTransformFunc(attributes.GVK(schema), gomock.Any(), false).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
+			bloi.EXPECT().ListByOptions(gomock.Cond(isDerivedContext), &opts, partitions, req.Namespace).Return(nil, 0, nil, "", fmt.Errorf("error"))
+			tb.EXPECT().GetTransformFunc(attributes.GVK(schema), gomock.Any(), false, nil).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
 
-			_, _, _, err = s.ListByPartitions(req, schema, partitions)
+			_, _, _, _, err = s.ListByPartitions(req, schema, partitions)
 			assert.NotNil(t, err)
 		},
 	})
 	t.Parallel()
 	for _, test := range tests {
-		t.Run(test.description, func(t *testing.T) { test.test(t) })
+		t.Run(test.description, func(t *testing.T) {
+			test.test(t)
+		})
+	}
+}
+
+func TestAugmentRelationships(t *testing.T) {
+	type testCase struct {
+		description string
+		test        func(t *testing.T)
+	}
+	var tests []testCase
+	tests = append(tests, testCase{
+		description: "unrecognized GVKs aren't augmented",
+		test: func(t *testing.T) {
+			nsi := &factory.Cache{
+				ByOptionsLister: NewMockByOptionsLister(gomock.NewController(t)),
+			}
+			cg := NewMockClientGetter(gomock.NewController(t))
+			cf := NewMockCacheFactory(gomock.NewController(t))
+			tb := NewMockTransformBuilder(gomock.NewController(t))
+			s := &Store{
+				ctx:              context.Background(),
+				namespaceCache:   nsi,
+				clientGetter:     cg,
+				cacheFactory:     cf,
+				transformBuilder: tb,
+			}
+			req := &types.APIRequest{
+				Request: &http.Request{
+					URL: &url.URL{},
+				},
+			}
+			schema := &types.APISchema{
+				Schema: &schemas.Schema{Attributes: map[string]interface{}{
+					"columns": []common.ColumnDefinition{
+						{
+							Field: "some.field",
+						},
+					},
+					"verbs": []string{"list", "watch"},
+				}},
+			}
+			originalItems := []unstructured.Unstructured{
+				unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"kind": "apple",
+						"metadata": map[string]interface{}{
+							"name": "fuji",
+						},
+						"data": map[string]interface{}{
+							"color": "pink",
+						},
+					},
+				},
+			}
+			originalList := unstructured.UnstructuredList{
+				Items: originalItems,
+			}
+			augmentedList := unstructured.UnstructuredList{
+				Items: make([]unstructured.Unstructured, len(originalItems), len(originalItems)),
+			}
+			copy(augmentedList.Items, originalItems)
+			gvk := schema2.GroupVersionKind{
+				Group:   "some",
+				Version: "test",
+				Kind:    "gvk",
+			}
+
+			setupContext(req)
+			attributes.SetGVK(schema, gvk)
+			err := s.AugmentRelationships(req.Context(), gvk, &originalList, nil)
+			assert.Nil(t, err)
+			assert.Equal(t, augmentedList.Items, originalItems)
+		},
+	})
+	tests = append(tests, testCase{
+		description: "Deployments get augmented.",
+		test: func(t *testing.T) {
+			nsi := &factory.Cache{
+				ByOptionsLister: NewMockByOptionsLister(gomock.NewController(t)),
+			}
+			cg := NewMockClientGetter(gomock.NewController(t))
+			cf := NewMockCacheFactory(gomock.NewController(t))
+			bloi := NewMockByOptionsLister(gomock.NewController(t))
+			tb := NewMockTransformBuilder(gomock.NewController(t))
+			inf := &informer.Informer{
+				ByOptionsLister: bloi,
+			}
+			c := &factory.Cache{
+				ByOptionsLister: inf,
+			}
+			s := &Store{
+				ctx:              context.Background(),
+				namespaceCache:   nsi,
+				clientGetter:     cg,
+				cacheFactory:     cf,
+				transformBuilder: tb,
+			}
+			podSchema := &types.APISchema{
+				Schema: &schemas.Schema{
+					Attributes: map[string]interface{}{
+						"version":    "v1",
+						"kind":       "Pod",
+						"group":      "",
+						"namespaced": true,
+						"verbs":      []string{"list", "watch"},
+					},
+					ResourceMethods: []string{"GET"},
+				},
+			}
+			apiSchemas := &types.APISchemas{
+				Schemas: map[string]*types.APISchema{
+					"pod": podSchema,
+				},
+			}
+			apiOp := &types.APIRequest{
+				Request: &http.Request{
+					URL: &url.URL{},
+				},
+				Schemas: apiSchemas,
+			}
+			originalItems := []unstructured.Unstructured{
+				unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"kind": "Deployment",
+						"metadata": map[string]interface{}{
+							"name": "fuji",
+						},
+						"data": map[string]interface{}{
+							"color": "pink",
+						},
+					},
+				},
+			}
+			originalList := unstructured.UnstructuredList{
+				Items: originalItems,
+			}
+			augmentedList := unstructured.UnstructuredList{
+				Items: make([]unstructured.Unstructured, len(originalItems), len(originalItems)),
+			}
+			gvk := schema2.GroupVersionKind{
+				Group:   "apps",
+				Version: "v1",
+				Kind:    "Deployment",
+			}
+			podGVK := schema2.GroupVersionKind{
+				Group:   "",
+				Version: "v1",
+				Kind:    "Pod",
+			}
+			ctx := context.Background()
+
+			copy(augmentedList.Items, originalItems)
+			cg.EXPECT().TableAdminClient(apiOp, podSchema, "", &WarningBuffer{}).Return(nil, nil)
+			cf.EXPECT().CacheFor(ctx,
+				gomock.Any(), // map[string]informer.IndexedField{}
+				gomock.Any(),
+				gomock.Any(),
+				gomock.Any(),
+				gomock.Any(), // can't do (*tablelistconvert.Client)(nil),
+				attributes.GVK(podSchema),
+				attributes.Namespaced(podSchema),
+				true).Return(c, nil)
+			tb.EXPECT().GetTransformFunc(podGVK, gomock.Any(), false, nil).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
+			cf.EXPECT().DoneWithCache(c)
+			bloi.EXPECT().AugmentList(ctx, &originalList, gomock.Any(), gomock.Any(), true, gomock.Any()).Return(nil)
+			err := s.AugmentRelationships(ctx, gvk, &originalList, apiOp)
+			assert.Nil(t, err)
+		},
+	})
+	t.Parallel()
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			test.test(t)
+		})
 	}
 }
 
@@ -763,78 +1038,32 @@ func TestListByPartitionWithUserAccess(t *testing.T) {
 			setupContext(apiOp)
 			attributes.SetGVK(theSchema, gvk)
 			cg.EXPECT().TableAdminClient(apiOp, theSchema, "", &WarningBuffer{}).Return(ri, nil)
+			someField := &informer.JSONPathField{Path: []string{"some", "field"}}
+			idField := &informer.JSONPathField{Path: []string{"id"}}
+			stateField := &informer.JSONPathField{Path: []string{"metadata", "state", "name"}}
 			cf.EXPECT().CacheFor(gomock.Cond(isDerivedContext),
-				[][]string{{"some", "field"}, {"id"}, {"metadata", "state", "name"}},
+				map[string]informer.IndexedField{
+					someField.ColumnName():  someField,
+					idField.ColumnName():    idField,
+					stateField.ColumnName(): stateField,
+				},
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
 				&tablelistconvert.Client{ResourceInterface: ri},
 				attributes.GVK(theSchema),
-				gomock.Any(),
 				attributes.Namespaced(theSchema),
 				true).Return(c, nil)
 			cf.EXPECT().DoneWithCache(c)
-			tb.EXPECT().GetTransformFunc(attributes.GVK(theSchema), gomock.Any(), false).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
+			tb.EXPECT().GetTransformFunc(attributes.GVK(theSchema), gomock.Any(), false, nil).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
 
 			listToReturn := &unstructured.UnstructuredList{
 				Items: make([]unstructured.Unstructured, 0, 0),
 			}
-			bloi.EXPECT().ListByOptions(gomock.Cond(isDerivedContext), opts, partitions, "").Return(listToReturn, len(listToReturn.Items), "", nil)
-			_, _, _, err := s.ListByPartitions(apiOp, theSchema, partitions)
+			bloi.EXPECT().ListByOptions(gomock.Cond(isDerivedContext), opts, partitions, "").Return(listToReturn, len(listToReturn.Items), nil, "", nil)
+			_, _, _, _, err := s.ListByPartitions(apiOp, theSchema, partitions)
 			assert.Nil(t, err)
 		})
-	}
-}
-
-func TestTableColsToCommonCols(t *testing.T) {
-	type testCase struct {
-		description string
-		test        func(t *testing.T)
-	}
-	var tests []testCase
-	tests = append(tests, testCase{
-		description: "table columns are converted to common columns",
-		test: func(t *testing.T) {
-			originalColumns := []table.Column{
-				{
-					Name:        "weight",
-					Field:       "$.metadata.fields[0]",
-					Type:        "integer",
-					Description: "how much the pod weighs",
-				},
-				{
-					Name:        "position",
-					Field:       "$.metadata.fields[1]",
-					Type:        "string",
-					Description: "number of this pod",
-				},
-				{
-					Name:        "favoriteColour",
-					Field:       "$.metadata.fields[3]",
-					Type:        "string",
-					Description: "green of course",
-				},
-			}
-			expectedColumns := []common.ColumnDefinition{
-				{
-					TableColumnDefinition: metav1.TableColumnDefinition{Name: "weight", Type: "integer", Description: "how much the pod weighs"},
-					Field:                 "$.metadata.fields[0]",
-				},
-				{
-					TableColumnDefinition: metav1.TableColumnDefinition{Name: "position", Type: "string", Description: "number of this pod"},
-					Field:                 "$.metadata.fields[1]",
-				},
-				{TableColumnDefinition: metav1.TableColumnDefinition{Name: "favoriteColour", Type: "string", Description: "green of course"},
-					Field: "$.metadata.fields[2]",
-				},
-			}
-			got := tableColsToCommonCols(originalColumns)
-			assert.Equal(t, expectedColumns, got)
-		},
-	})
-	t.Parallel()
-	for _, test := range tests {
-		t.Run(test.description, func(t *testing.T) { test.test(t) })
 	}
 }
 
@@ -855,6 +1084,18 @@ func TestReset(t *testing.T) {
 			cs := NewMockSchemaColumnSetter(gomock.NewController(t))
 			ri := NewMockResourceInterface(gomock.NewController(t))
 			tb := NewMockTransformBuilder(gomock.NewController(t))
+			nsSchema := &types.APISchema{
+				Schema: &schemas.Schema{
+					Attributes: map[string]interface{}{
+						"group":    "",
+						"version":  "v1",
+						"kind":     "Namespace",
+						"resource": "namespaces",
+					},
+				},
+			}
+			sc := NewMockSchemaCollection(gomock.NewController(t))
+
 			s := &Store{
 				ctx:              context.Background(),
 				namespaceCache:   nsc,
@@ -863,24 +1104,32 @@ func TestReset(t *testing.T) {
 				columnSetter:     cs,
 				cfInitializer:    func() (CacheFactory, error) { return cf, nil },
 				transformBuilder: tb,
+				schemas:          sc,
 			}
-			nsSchema := baseNSSchema
-			gvk := attributes.GVK(&nsSchema)
+			gvk := attributes.GVK(nsSchema)
 			cf.EXPECT().Stop(gvk).Return(nil)
+			sc.EXPECT().ByGVK(namespaceGVK).Return("namespace")
+			sc.EXPECT().Schema("namespace").Return(nsSchema)
 			cs.EXPECT().SetColumns(gomock.Any(), gomock.Any()).Return(nil)
-			cg.EXPECT().TableAdminClient(nil, &nsSchema, "", &WarningBuffer{}).Return(ri, nil)
+			cg.EXPECT().TableAdminClient(nil, nsSchema, "", &WarningBuffer{}).Return(ri, nil)
+			idField := &informer.JSONPathField{Path: []string{"id"}}
+			stateField := &informer.JSONPathField{Path: []string{"metadata", "state", "name"}}
+			displayField := &informer.JSONPathField{Path: []string{"spec", "displayName"}}
 			cf.EXPECT().CacheFor(context.Background(),
-				[][]string{{`id`}, {`metadata`, `state`, `name`}, {"spec", "displayName"}},
+				map[string]informer.IndexedField{
+					idField.ColumnName():      idField,
+					stateField.ColumnName():   stateField,
+					displayField.ColumnName(): displayField,
+				},
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
 				&tablelistconvert.Client{ResourceInterface: ri},
-				attributes.GVK(&nsSchema),
-				gomock.Any(),
+				attributes.GVK(nsSchema),
 				false,
 				true).Return(nsc, nil)
 			cf.EXPECT().DoneWithCache(nsc)
-			tb.EXPECT().GetTransformFunc(gvk, gomock.Any(), false).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
+			tb.EXPECT().GetTransformFunc(gvk, gomock.Any(), false, nil).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
 			err := s.Reset(gvk)
 			assert.Nil(t, err)
 			assert.Equal(t, nsc, s.namespaceCache)
@@ -894,6 +1143,7 @@ func TestReset(t *testing.T) {
 			cs := NewMockSchemaColumnSetter(gomock.NewController(t))
 			tb := NewMockTransformBuilder(gomock.NewController(t))
 
+			sc := NewMockSchemaCollection(gomock.NewController(t))
 			s := &Store{
 				ctx:              context.Background(),
 				clientGetter:     cg,
@@ -901,6 +1151,7 @@ func TestReset(t *testing.T) {
 				columnSetter:     cs,
 				cfInitializer:    func() (CacheFactory, error) { return cf, nil },
 				transformBuilder: tb,
+				schemas:          sc,
 			}
 
 			gvk := schema.GroupVersionKind{}
@@ -917,6 +1168,7 @@ func TestReset(t *testing.T) {
 			cs := NewMockSchemaColumnSetter(gomock.NewController(t))
 			tb := NewMockTransformBuilder(gomock.NewController(t))
 
+			sc := NewMockSchemaCollection(gomock.NewController(t))
 			s := &Store{
 				ctx:              context.Background(),
 				clientGetter:     cg,
@@ -924,12 +1176,24 @@ func TestReset(t *testing.T) {
 				columnSetter:     cs,
 				cfInitializer:    func() (CacheFactory, error) { return cf, nil },
 				transformBuilder: tb,
+				schemas:          sc,
 			}
 
-			nsSchema := baseNSSchema
-			gvk := attributes.GVK(&nsSchema)
+			nsSchema := &types.APISchema{
+				Schema: &schemas.Schema{
+					Attributes: map[string]interface{}{
+						"group":    "",
+						"version":  "v1",
+						"kind":     "Namespace",
+						"resource": "namespaces",
+					},
+				},
+			}
+			gvk := attributes.GVK(nsSchema)
 
 			cf.EXPECT().Stop(gvk).Return(nil)
+			sc.EXPECT().ByGVK(namespaceGVK).Return("namespace")
+			sc.EXPECT().Schema("namespace").Return(nsSchema)
 			cs.EXPECT().SetColumns(gomock.Any(), gomock.Any()).Return(fmt.Errorf("error"))
 			err := s.Reset(gvk)
 			assert.NotNil(t, err)
@@ -943,6 +1207,7 @@ func TestReset(t *testing.T) {
 			cs := NewMockSchemaColumnSetter(gomock.NewController(t))
 			tb := NewMockTransformBuilder(gomock.NewController(t))
 
+			sc := NewMockSchemaCollection(gomock.NewController(t))
 			s := &Store{
 				ctx:              context.Background(),
 				clientGetter:     cg,
@@ -950,13 +1215,25 @@ func TestReset(t *testing.T) {
 				columnSetter:     cs,
 				cfInitializer:    func() (CacheFactory, error) { return cf, nil },
 				transformBuilder: tb,
+				schemas:          sc,
 			}
-			nsSchema := baseNSSchema
-			gvk := attributes.GVK(&nsSchema)
+			nsSchema := &types.APISchema{
+				Schema: &schemas.Schema{
+					Attributes: map[string]interface{}{
+						"group":    "",
+						"version":  "v1",
+						"kind":     "Namespace",
+						"resource": "namespaces",
+					},
+				},
+			}
+			gvk := attributes.GVK(nsSchema)
 
 			cf.EXPECT().Stop(gvk).Return(nil)
+			sc.EXPECT().ByGVK(namespaceGVK).Return("namespace")
+			sc.EXPECT().Schema("namespace").Return(nsSchema)
 			cs.EXPECT().SetColumns(gomock.Any(), gomock.Any()).Return(nil)
-			cg.EXPECT().TableAdminClient(nil, &nsSchema, "", &WarningBuffer{}).Return(nil, fmt.Errorf("error"))
+			cg.EXPECT().TableAdminClient(nil, nsSchema, "", &WarningBuffer{}).Return(nil, fmt.Errorf("error"))
 			err := s.Reset(gvk)
 			assert.NotNil(t, err)
 		},
@@ -970,6 +1247,7 @@ func TestReset(t *testing.T) {
 			ri := NewMockResourceInterface(gomock.NewController(t))
 			tb := NewMockTransformBuilder(gomock.NewController(t))
 
+			sc := NewMockSchemaCollection(gomock.NewController(t))
 			s := &Store{
 				ctx:              context.Background(),
 				clientGetter:     cg,
@@ -977,24 +1255,42 @@ func TestReset(t *testing.T) {
 				columnSetter:     cs,
 				cfInitializer:    func() (CacheFactory, error) { return cf, nil },
 				transformBuilder: tb,
+				schemas:          sc,
 			}
-			nsSchema := baseNSSchema
-			gvk := attributes.GVK(&nsSchema)
+			nsSchema := &types.APISchema{
+				Schema: &schemas.Schema{
+					Attributes: map[string]interface{}{
+						"group":    "",
+						"version":  "v1",
+						"kind":     "Namespace",
+						"resource": "namespaces",
+					},
+				},
+			}
+			gvk := attributes.GVK(nsSchema)
 
 			cf.EXPECT().Stop(gvk).Return(nil)
+			sc.EXPECT().ByGVK(namespaceGVK).Return("namespace")
+			sc.EXPECT().Schema("namespace").Return(nsSchema)
 			cs.EXPECT().SetColumns(gomock.Any(), gomock.Any()).Return(nil)
-			cg.EXPECT().TableAdminClient(nil, &nsSchema, "", &WarningBuffer{}).Return(ri, nil)
+			cg.EXPECT().TableAdminClient(nil, nsSchema, "", &WarningBuffer{}).Return(ri, nil)
+			idField := &informer.JSONPathField{Path: []string{"id"}}
+			stateField := &informer.JSONPathField{Path: []string{"metadata", "state", "name"}}
+			displayField := &informer.JSONPathField{Path: []string{"spec", "displayName"}}
 			cf.EXPECT().CacheFor(context.Background(),
-				[][]string{{`id`}, {`metadata`, `state`, `name`}, {"spec", "displayName"}},
+				map[string]informer.IndexedField{
+					idField.ColumnName():      idField,
+					stateField.ColumnName():   stateField,
+					displayField.ColumnName(): displayField,
+				},
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
 				&tablelistconvert.Client{ResourceInterface: ri},
-				attributes.GVK(&nsSchema),
-				gomock.Any(),
+				attributes.GVK(nsSchema),
 				false,
 				true).Return(nil, fmt.Errorf("error"))
-			tb.EXPECT().GetTransformFunc(gvk, gomock.Any(), false).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
+			tb.EXPECT().GetTransformFunc(gvk, gomock.Any(), false, nil).Return(func(obj interface{}) (interface{}, error) { return obj, nil })
 			err := s.Reset(gvk)
 			assert.NotNil(t, err)
 		},
@@ -1751,6 +2047,203 @@ func TestUpdate(t *testing.T) {
 			} else {
 				assert.NoError(t, err)
 			}
+		})
+	}
+}
+
+func TestPatch(t *testing.T) {
+	type input struct {
+		apiOp  *types.APIRequest
+		schema *types.APISchema
+		params types.APIObject
+		id     string
+	}
+
+	type expected struct {
+		patchType apitypes.PatchType
+		resp      *unstructured.Unstructured
+		warning   []types.Warning
+		err       error
+	}
+
+	testCases := []struct {
+		name              string
+		input             input
+		expected          expected
+		expectedPatchBody string
+	}{
+		{
+			name: "default content-type uses strategic merge patch",
+			input: input{
+				apiOp: &types.APIRequest{
+					Schema: &types.APISchema{
+						Schema: &schemas.Schema{ID: "testing"},
+					},
+					Request: &http.Request{
+						URL:    &url.URL{},
+						Method: http.MethodPatch,
+						Body:   io.NopCloser(strings.NewReader(`{"metadata":{"labels":{"a":"b"}}}`)),
+						Header: http.Header{},
+					},
+					Method: http.MethodPatch,
+				},
+				schema: &types.APISchema{
+					Schema: &schemas.Schema{
+						ID: "testing",
+						Attributes: map[string]interface{}{
+							"version":    "v1",
+							"kind":       "Secret",
+							"namespaced": true,
+						},
+					},
+				},
+				params: types.APIObject{Object: map[string]interface{}{"metadata": map[string]interface{}{"namespace": "testing-ns"}}},
+				id:     "testing-secret",
+			},
+			expectedPatchBody: `{"metadata":{"labels":{"a":"b"}}}`,
+			expected: expected{
+				patchType: apitypes.StrategicMergePatchType,
+				resp: &unstructured.Unstructured{Object: map[string]interface{}{
+					"apiVersion": "v1",
+					"kind":       "Secret",
+					"metadata": map[string]interface{}{
+						"name": "testing-secret",
+					},
+				}},
+				warning: []types.Warning{},
+				err:     nil,
+			},
+		},
+		{
+			name: "merge patch content-type is respected",
+			input: input{
+				apiOp: &types.APIRequest{
+					Schema: &types.APISchema{
+						Schema: &schemas.Schema{ID: "testing"},
+					},
+					Request: &http.Request{
+						URL:    &url.URL{},
+						Method: http.MethodPatch,
+						Body:   io.NopCloser(strings.NewReader(`{"metadata":{"labels":{"a":"b"}}}`)),
+						Header: http.Header{"Content-Type": []string{string(apitypes.MergePatchType)}},
+					},
+					Method: http.MethodPatch,
+				},
+				schema: &types.APISchema{
+					Schema: &schemas.Schema{
+						ID: "testing",
+						Attributes: map[string]interface{}{
+							"version":    "v1",
+							"kind":       "Secret",
+							"namespaced": true,
+						},
+					},
+				},
+				params: types.APIObject{Object: map[string]interface{}{"metadata": map[string]interface{}{"namespace": "testing-ns"}}},
+				id:     "testing-secret",
+			},
+			expectedPatchBody: `{"metadata":{"labels":{"a":"b"}}}`,
+			expected: expected{
+				patchType: apitypes.MergePatchType,
+				resp: &unstructured.Unstructured{Object: map[string]interface{}{
+					"apiVersion": "v1",
+					"kind":       "Secret",
+					"metadata": map[string]interface{}{
+						"name": "testing-secret",
+					},
+				}},
+				warning: []types.Warning{},
+				err:     nil,
+			},
+		},
+		{
+			name: "json patch content-type is respected",
+			input: input{
+				apiOp: &types.APIRequest{
+					Schema: &types.APISchema{
+						Schema: &schemas.Schema{ID: "testing"},
+					},
+					Request: &http.Request{
+						URL:    &url.URL{},
+						Method: http.MethodPatch,
+						Body:   io.NopCloser(strings.NewReader(`[{"op":"replace","path":"/metadata/labels/a","value":"b"}]`)),
+						Header: http.Header{"Content-Type": []string{string(apitypes.JSONPatchType)}},
+					},
+					Method: http.MethodPatch,
+				},
+				schema: &types.APISchema{
+					Schema: &schemas.Schema{
+						ID: "testing",
+						Attributes: map[string]interface{}{
+							"version":    "v1",
+							"kind":       "Secret",
+							"namespaced": true,
+						},
+					},
+				},
+				params: types.APIObject{Object: map[string]interface{}{"metadata": map[string]interface{}{"namespace": "testing-ns"}}},
+				id:     "testing-secret",
+			},
+			expectedPatchBody: `[{"op":"replace","path":"/metadata/labels/a","value":"b"}]`,
+			expected: expected{
+				patchType: apitypes.JSONPatchType,
+				resp: &unstructured.Unstructured{Object: map[string]interface{}{
+					"apiVersion": "v1",
+					"kind":       "Secret",
+					"metadata": map[string]interface{}{
+						"name": "testing-secret",
+					},
+				}},
+				warning: []types.Warning{},
+				err:     nil,
+			},
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			testClientFactory, err := client.NewFactory(&rest.Config{}, false)
+			assert.NoError(t, err)
+
+			fakeClient := fake.NewSimpleDynamicClient(runtime.NewScheme())
+
+			var gotPatchType apitypes.PatchType
+			var gotPatch []byte
+
+			fakeClient.PrependReactor("patch", "*", func(action clientgotesting.Action) (handled bool, ret runtime.Object, err error) {
+				patchAction, ok := action.(clientgotesting.PatchAction)
+				if !ok {
+					return true, nil, fmt.Errorf("unexpected patch action type %T", action)
+				}
+
+				gotPatchType = patchAction.GetPatchType()
+				gotPatch = patchAction.GetPatch()
+
+				return true, tt.expected.resp, tt.expected.err
+			})
+
+			testStore := Store{
+				clientGetter: &testFactory{Factory: testClientFactory,
+					fakeClient: fakeClient,
+				},
+			}
+
+			value, warning, err := testStore.Update(tt.input.apiOp, tt.input.schema, tt.input.params, tt.input.id)
+
+			assert.Equal(t, tt.expected.patchType, gotPatchType)
+			if tt.expected.patchType == apitypes.StrategicMergePatchType {
+				var expectedJSON map[string]interface{}
+				var actualJSON map[string]interface{}
+				assert.NoError(t, json.Unmarshal([]byte(tt.expectedPatchBody), &expectedJSON))
+				assert.NoError(t, json.Unmarshal(gotPatch, &actualJSON))
+				assert.Equal(t, expectedJSON, actualJSON)
+			} else {
+				assert.True(t, bytes.Equal([]byte(tt.expectedPatchBody), gotPatch))
+			}
+
+			assert.Equal(t, tt.expected.resp, value)
+			assert.Equal(t, tt.expected.warning, warning)
+			assert.Equal(t, tt.expected.err, err)
 		})
 	}
 }
