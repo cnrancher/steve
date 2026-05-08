@@ -22,7 +22,7 @@ require (
 	github.com/evanphx/json-patch v5.9.11+incompatible
 	github.com/go-logr/logr v1.4.2
 	github.com/golang/protobuf v1.5.4
-	github.com/google/gnostic-models v0.7.0
+	github.com/google/gnostic-models v0.7.1
 	github.com/google/go-cmp v0.7.0
 	github.com/gorilla/mux v1.8.1
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
@@ -35,7 +35,7 @@ require (
 	github.com/rancher/lasso v0.2.5
 	github.com/rancher/norman v0.7.1-0.20251002202451-d14394e537ab
 	github.com/rancher/remotedialer v0.6.0-rc.1
-	github.com/rancher/wrangler/v3 v3.3.4
+	github.com/rancher/wrangler/v3 v3.3.5
 	github.com/sirupsen/logrus v1.9.4
 	github.com/stretchr/testify v1.11.1
 	github.com/tinylib/msgp v1.6.3
@@ -43,7 +43,7 @@ require (
 	go.uber.org/mock v0.6.0
 	go.yaml.in/yaml/v3 v3.0.4
 	golang.org/x/sync v0.18.0
-	google.golang.org/protobuf v1.36.9
+	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.34.1
 	k8s.io/apiextensions-apiserver v0.34.1
@@ -54,7 +54,7 @@ require (
 	k8s.io/klog/v2 v2.130.1
 	k8s.io/kube-aggregator v0.34.1
 	k8s.io/kube-openapi v0.0.0-20250710124328-f3f2b991d03b
-	k8s.io/kubernetes v1.33.1
+	k8s.io/kubernetes v1.33.6
 	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4
 	modernc.org/sqlite v1.40.1
 	sigs.k8s.io/controller-runtime v0.21.0
