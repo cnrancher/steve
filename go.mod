@@ -29,7 +29,7 @@ require (
 	github.com/rancher/norman v0.6.1
 	github.com/rancher/remotedialer v0.4.5-rc.3
 	github.com/rancher/wrangler/v3 v3.2.4
-	github.com/sirupsen/logrus v1.9.3
+	github.com/sirupsen/logrus v1.9.4
 	github.com/stretchr/testify v1.10.0
 	github.com/urfave/cli/v2 v2.27.7
 	go.uber.org/mock v0.5.2
@@ -45,7 +45,7 @@ require (
 	k8s.io/klog v1.0.0
 	k8s.io/kube-aggregator v0.33.1
 	k8s.io/kube-openapi v0.0.0-20250318190949-c8a335a9a2ff
-	k8s.io/kubernetes v1.33.1
+	k8s.io/kubernetes v1.33.6
 	k8s.io/utils v0.0.0-20241104100929-3ea5e8cea738
 	modernc.org/sqlite v1.38.2
 	sigs.k8s.io/controller-runtime v0.21.0
