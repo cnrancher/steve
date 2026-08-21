@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"strconv"
@@ -469,15 +468,28 @@ func (s *Store) Update(apiOp *types.APIRequest, schema *types.APISchema, params 
 		input = params.Data()
 	)
 
-	ns := types.Namespace(input)
+	if input == nil {
+		input = data.Object{}
+	}
+
+	namespace := types.Namespace(input)
+	if attributes.Namespaced(schema) && namespace == "" {
+		if apiOp.Namespace == "" {
+			return nil, nil, apierror.NewAPIError(validation.InvalidBodyContent, errNamespaceRequired)
+		}
+
+		namespace = apiOp.Namespace
+		input.SetNested(namespace, "metadata", "namespace")
+	}
+
 	buffer := WarningBuffer{}
-	k8sClient, err := metricsStore.Wrap(s.clientGetter.Client(apiOp, schema, ns, &buffer))
+	k8sClient, err := metricsStore.Wrap(s.clientGetter.Client(apiOp, schema, namespace, &buffer))
 	if err != nil {
 		return nil, nil, err
 	}
 
 	if apiOp.Method == http.MethodPatch {
-		bytes, err := ioutil.ReadAll(io.LimitReader(apiOp.Request.Body, 2<<20))
+		bytes, err := io.ReadAll(io.LimitReader(apiOp.Request.Body, 2<<20))
 		if err != nil {
 			return nil, nil, err
 		}

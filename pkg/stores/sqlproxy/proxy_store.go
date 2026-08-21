@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"regexp"
 	"strings"
@@ -24,6 +23,7 @@ import (
 	"github.com/rancher/steve/pkg/stores/queryhelper"
 	"github.com/rancher/wrangler/v3/pkg/data"
 	"github.com/rancher/wrangler/v3/pkg/kv"
+	"github.com/rancher/wrangler/v3/pkg/schemas"
 	"github.com/rancher/wrangler/v3/pkg/schemas/validation"
 	"github.com/rancher/wrangler/v3/pkg/summary"
 	"github.com/sirupsen/logrus"
@@ -37,6 +37,7 @@ import (
 	metricsStore "github.com/rancher/steve/pkg/stores/metrics"
 	"github.com/rancher/steve/pkg/stores/sqlpartition/listprocessor"
 	"github.com/rancher/steve/pkg/stores/sqlproxy/tablelistconvert"
+	"github.com/rancher/steve/pkg/watchlist"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -116,6 +117,7 @@ var (
 				Name:         "metadata.fields[3]_1",
 				Type:         "INTEGER",
 				GetValueFunc: informer.ExtractPodRestartTimestamp,
+				IsTimestamp:  true,
 			},
 		},
 		gvkKey("", "v1", "ReplicationController"): {
@@ -185,21 +187,32 @@ var (
 		gvkKey("cluster.x-k8s.io", "v1beta1", "MachineDeployment"): {
 			"spec.clusterName": &informer.JSONPathField{Path: []string{"spec", "clusterName"}},
 		},
+		gvkKey("cluster.x-k8s.io", "v1beta2", "Machine"): {
+			"spec.clusterName": &informer.JSONPathField{Path: []string{"spec", "clusterName"}},
+		},
+		gvkKey("cluster.x-k8s.io", "v1beta2", "MachineDeployment"): {
+			"spec.clusterName": &informer.JSONPathField{Path: []string{"spec", "clusterName"}},
+		},
 		gvkKey("management.cattle.io", "v3", "Cluster"): {
-			"spec.internal":                &informer.JSONPathField{Path: []string{"spec", "internal"}},
-			"spec.displayName":             &informer.JSONPathField{Path: []string{"spec", "displayName"}},
-			"status.allocatable.cpu":       &informer.JSONPathField{Type: "", Path: []string{"status", "allocatable", "cpu"}},
-			"status.allocatable.cpuRaw":    &informer.JSONPathField{Type: "REAL", Path: []string{"status", "allocatable", "cpuRaw"}},
-			"status.allocatable.memory":    &informer.JSONPathField{Type: "", Path: []string{"status", "allocatable", "memory"}},
-			"status.allocatable.memoryRaw": &informer.JSONPathField{Type: "REAL", Path: []string{"status", "allocatable", "memoryRaw"}},
-			"status.allocatable.pods":      &informer.JSONPathField{Type: "INT", Path: []string{"status", "allocatable", "pods"}},
-			"status.requested.cpu":         &informer.JSONPathField{Type: "", Path: []string{"status", "requested", "cpu"}},
-			"status.requested.cpuRaw":      &informer.JSONPathField{Type: "REAL", Path: []string{"status", "requested", "cpuRaw"}},
-			"status.requested.memory":      &informer.JSONPathField{Type: "", Path: []string{"status", "requested", "memory"}},
-			"status.requested.memoryRaw":   &informer.JSONPathField{Type: "REAL", Path: []string{"status", "requested", "memoryRaw"}},
-			"status.requested.pods":        &informer.JSONPathField{Type: "INT", Path: []string{"status", "requested", "pods"}},
-			"status.connected":             &informer.JSONPathField{Path: []string{"status", "connected"}},
-			"status.provider":              &informer.JSONPathField{Path: []string{"status", "provider"}},
+			"spec.fleetWorkspaceName":       &informer.JSONPathField{Path: []string{"spec", "fleetWorkspaceName"}},
+			"spec.internal":                 &informer.JSONPathField{Path: []string{"spec", "internal"}},
+			"spec.displayName":              &informer.JSONPathField{Path: []string{"spec", "displayName"}},
+			"status.allocatable.cpu":        &informer.JSONPathField{Type: "", Path: []string{"status", "allocatable", "cpu"}},
+			"status.allocatable.cpuRaw":     &informer.JSONPathField{Type: "REAL", Path: []string{"status", "allocatable", "cpuRaw"}},
+			"status.allocatable.memory":     &informer.JSONPathField{Type: "", Path: []string{"status", "allocatable", "memory"}},
+			"status.allocatable.memoryRaw":  &informer.JSONPathField{Type: "REAL", Path: []string{"status", "allocatable", "memoryRaw"}},
+			"status.allocatable.pods":       &informer.JSONPathField{Type: "INT", Path: []string{"status", "allocatable", "pods"}},
+			"status.driver":                 &informer.JSONPathField{Path: []string{"status", "driver"}},
+			"status.info.kubernetesVersion": &informer.JSONPathField{Path: []string{"status", "info", "kubernetesVersion"}},
+			"status.info.machineProvider":   &informer.JSONPathField{Path: []string{"status", "info", "machineProvider"}},
+			"status.info.nodeCount":         &informer.JSONPathField{Type: "INT", Path: []string{"status", "info", "nodeCount"}},
+			"status.requested.cpu":          &informer.JSONPathField{Type: "", Path: []string{"status", "requested", "cpu"}},
+			"status.requested.cpuRaw":       &informer.JSONPathField{Type: "REAL", Path: []string{"status", "requested", "cpuRaw"}},
+			"status.requested.memory":       &informer.JSONPathField{Type: "", Path: []string{"status", "requested", "memory"}},
+			"status.requested.memoryRaw":    &informer.JSONPathField{Type: "REAL", Path: []string{"status", "requested", "memoryRaw"}},
+			"status.requested.pods":         &informer.JSONPathField{Type: "INT", Path: []string{"status", "requested", "pods"}},
+			"status.connected":              &informer.JSONPathField{Path: []string{"status", "connected"}},
+			"status.provider":               &informer.JSONPathField{Path: []string{"status", "provider"}},
 		},
 		gvkKey("management.cattle.io", "v3", "ClusterRoleTemplateBinding"): {
 			"clusterName":       &informer.JSONPathField{Path: []string{"clusterName"}},
@@ -268,13 +281,14 @@ var (
 	namespaceGVK             = schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Namespace"}
 	mcioProjectGvk           = schema.GroupVersionKind{Group: "management.cattle.io", Version: "v3", Kind: "Project"}
 	pcioClusterGvk           = schema.GroupVersionKind{Group: "provisioning.cattle.io", Version: "v1", Kind: "Cluster"}
-	namespaceProjectLabelDep = sqltypes.ExternalLabelDependency{
-		SourceGVK:            gvkKey("", "v1", "Namespace"),
-		SourceLabelName:      "field.cattle.io/projectId",
-		TargetGVK:            gvkKey("management.cattle.io", "v3", "Project"),
-		TargetKeyFieldName:   "metadata.name",
+	namespaceProjectLabelDep = sqltypes.MustNewExternalLabelDependency(sqltypes.ExternalLabelDependency{
+		SourceGVK: gvkKey("", "v1", "Namespace"),
+		TargetGVK: gvkKey("management.cattle.io", "v3", "Project"),
+		SourceLabelTargetField: map[string]string{
+			"field.cattle.io/projectId": "metadata.name",
+		},
 		TargetFinalFieldName: "spec.displayName",
-	}
+	})
 	namespaceUpdates = sqltypes.ExternalGVKUpdates{
 		AffectedGVK:               namespaceGVK,
 		ExternalDependencies:      nil,
@@ -282,24 +296,38 @@ var (
 	}
 
 	secretGVK                    = schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Secret"}
-	secretProjectLabelDisplayDep = sqltypes.ExternalLabelDependency{
-		SourceGVK:            gvkKey("", "v1", "Secret"),
-		SourceLabelName:      "management.cattle.io/project-scoped-secret",
-		TargetGVK:            gvkKey("management.cattle.io", "v3", "Project"),
-		TargetKeyFieldName:   "metadata.name",
+	secretProjectLabelDisplayDep = sqltypes.MustNewExternalLabelDependency(sqltypes.ExternalLabelDependency{
+		SourceGVK: gvkKey("", "v1", "Secret"),
+		TargetGVK: gvkKey("management.cattle.io", "v3", "Project"),
+		SourceLabelTargetField: map[string]string{
+			"management.cattle.io/project-scoped-secret":         "metadata.name",
+			"management.cattle.io/project-scoped-secret-cluster": "spec.clusterName",
+		},
 		TargetFinalFieldName: "spec.displayName",
-	}
-	secretProjectLabelClusterDep = sqltypes.ExternalLabelDependency{
-		SourceGVK:            gvkKey("", "v1", "Secret"),
-		SourceLabelName:      "management.cattle.io/project-scoped-secret",
-		TargetGVK:            gvkKey("management.cattle.io", "v3", "Project"),
-		TargetKeyFieldName:   "metadata.name",
+	})
+	secretProjectLabelClusterDep = sqltypes.MustNewExternalLabelDependency(sqltypes.ExternalLabelDependency{
+		SourceGVK: gvkKey("", "v1", "Secret"),
+		TargetGVK: gvkKey("management.cattle.io", "v3", "Project"),
+		SourceLabelTargetField: map[string]string{
+			"management.cattle.io/project-scoped-secret":         "metadata.name",
+			"management.cattle.io/project-scoped-secret-cluster": "spec.clusterName",
+		},
 		TargetFinalFieldName: "spec.clusterName",
-	}
+	})
 	secretUpdates = sqltypes.ExternalGVKUpdates{
 		AffectedGVK:               secretGVK,
 		ExternalDependencies:      nil,
 		ExternalLabelDependencies: []sqltypes.ExternalLabelDependency{secretProjectLabelDisplayDep, secretProjectLabelClusterDep},
+	}
+
+	mcioProjectExternalUpdates = sqltypes.ExternalGVKUpdates{
+		AffectedGVK:          mcioProjectGvk,
+		ExternalDependencies: nil,
+		ExternalLabelDependencies: []sqltypes.ExternalLabelDependency{
+			namespaceProjectLabelDep,
+			secretProjectLabelDisplayDep,
+			secretProjectLabelClusterDep,
+		},
 	}
 
 	// Now sort provisioned.cattle.io.clusters based on their associated mgmt.cattle.io spec values
@@ -337,7 +365,7 @@ var (
 	}
 
 	externalGVKDependencies = sqltypes.ExternalGVKDependency{
-		mcioProjectGvk: &namespaceUpdates,
+		mcioProjectGvk: &mcioProjectExternalUpdates,
 		pcioClusterGvk: &pcioClusterUpdates,
 		secretGVK:      &secretUpdates,
 	}
@@ -431,7 +459,7 @@ type Store struct {
 type CacheFactoryInitializer func() (CacheFactory, error)
 
 type CacheFactory interface {
-	CacheFor(ctx context.Context, fields map[string]informer.IndexedField, externalUpdateInfo *sqltypes.ExternalGVKUpdates, selfUpdateInfo *sqltypes.ExternalGVKUpdates, transform cache.TransformFunc, client dynamic.ResourceInterface, gvk schema.GroupVersionKind, namespaced bool, watchable bool) (*factory.Cache, error)
+	CacheFor(ctx context.Context, fields map[string]informer.IndexedField, externalUpdateInfo *sqltypes.ExternalGVKUpdates, selfUpdateInfo *sqltypes.ExternalGVKUpdates, transform cache.TransformFunc, client dynamic.ResourceInterface, gvk schema.GroupVersionKind, namespaced bool, watchable bool, disableWatchList bool) (*factory.Cache, error)
 	DoneWithCache(*factory.Cache)
 	Stop(gvk schema.GroupVersionKind) error
 }
@@ -537,7 +565,8 @@ func (s *Store) initializeNamespaceCache() error {
 		tableClient,
 		gvk,
 		false,
-		true)
+		true,
+		watchlist.Disabled(nsSchema))
 	if err != nil {
 		return err
 	}
@@ -858,15 +887,28 @@ func (s *Store) Update(apiOp *types.APIRequest, schema *types.APISchema, params 
 		input = params.Data()
 	)
 
-	ns := types.Namespace(input)
+	if input == nil {
+		input = data.Object{}
+	}
+
+	namespace := types.Namespace(input)
+	if attributes.Namespaced(schema) && namespace == "" {
+		if apiOp.Namespace == "" {
+			return nil, nil, apierror.NewAPIError(validation.InvalidBodyContent, errNamespaceRequired)
+		}
+
+		namespace = apiOp.Namespace
+		input.SetNested(namespace, "metadata", "namespace")
+	}
+
 	buffer := WarningBuffer{}
-	k8sClient, err := metricsStore.Wrap(s.clientGetter.Client(apiOp, schema, ns, &buffer))
+	k8sClient, err := metricsStore.Wrap(s.clientGetter.Client(apiOp, schema, namespace, &buffer))
 	if err != nil {
 		return nil, nil, err
 	}
 
 	if apiOp.Method == http.MethodPatch {
-		bytes, err := ioutil.ReadAll(io.LimitReader(apiOp.Request.Body, 2<<20))
+		bytes, err := io.ReadAll(io.LimitReader(apiOp.Request.Body, 2<<20))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1185,6 +1227,32 @@ func (s *Store) cacheForWithDeps(ctx context.Context, apiOp *types.APIRequest, a
 		doneCacheFns = append(doneCacheFns, func() {
 			s.cacheFactory.DoneWithCache(mgmtClusterInf)
 		})
+	} else if gvk == secretGVK {
+		// v1.secrets depend on management.cattle.io.projects.
+		// On clusters without the projects CRD — every downstream cluster —
+		// the reflector LIST returns 404 forever, WaitForCacheSync never
+		// returns, and every /v1/secrets request hangs.
+		if id := s.schemas.ByGVK(mcioProjectGvk); id != "" {
+			mcioProjectSchema := types.APISchema{
+				Schema: &schemas.Schema{
+					Attributes: map[string]interface{}{
+						"group":      "management.cattle.io",
+						"version":    "v3",
+						"kind":       "Project",
+						"resource":   "projects",
+						"verbs":      []string{"get", "list", "watch"},
+						"namespaced": true,
+					},
+				},
+			}
+			mcioProjectInf, err := s.cacheFor(ctx, nil, &mcioProjectSchema)
+			if err != nil {
+				return nil, nil, err
+			}
+			doneCacheFns = append(doneCacheFns, func() {
+				s.cacheFactory.DoneWithCache(mcioProjectInf)
+			})
+		}
 	}
 
 	inf, err := s.cacheFor(ctx, apiOp, apiSchema)
@@ -1222,7 +1290,7 @@ func (s *Store) cacheFor(ctx context.Context, apiOp *types.APIRequest, apiSchema
 	transformFunc := s.transformBuilder.GetTransformFunc(gvk, cols, attributes.IsCRD(apiSchema), attributes.CRDJSONPathParsers(apiSchema))
 	tableClient := &tablelistconvert.Client{ResourceInterface: client}
 	ns := attributes.Namespaced(apiSchema)
-	inf, err := s.cacheFactory.CacheFor(ctx, fields, externalGVKDependencies[gvk], selfGVKDependencies[gvk], transformFunc, tableClient, gvk, ns, controllerschema.IsListWatchable(apiSchema))
+	inf, err := s.cacheFactory.CacheFor(ctx, fields, externalGVKDependencies[gvk], selfGVKDependencies[gvk], transformFunc, tableClient, gvk, ns, controllerschema.IsListWatchable(apiSchema), watchlist.Disabled(apiSchema))
 	if err != nil {
 		return nil, fmt.Errorf("cachefor %v: %w", gvk, err)
 	}

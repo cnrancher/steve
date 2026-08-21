@@ -4,37 +4,80 @@
   ],
   "baseBranchPatterns": [
     "main",
+    "release/v0.9",
+    "release/v0.8",
     "release/v0.7",
     "release/v0.6",
     "release/v0.5",
-    "release/v0.4",
-    "release/v0.3",
-    "release/v0.2"
+    "release/v0.4"
   ],
   "prHourlyLimit": 2,
+  "enabledManagers": [
+    "github-actions",
+    "custom.regex",
+    "gomod"
+  ],
   "packageRules": [
     {
       "enabled": false,
       "matchPackageNames": [
-        "/k8s.io/*/",
-        "/sigs.k8s.io/*/",
         "/go.opentelemetry.io/*/",
-        "/github.com/prometheus/*/"
-      ]
-    },
-    {
-      "matchUpdateTypes": [
-        "major",
-        "minor"
-      ],
-      "enabled": false,
-      "matchPackageNames": [
+        "/github.com/prometheus/*/",
         "/github.com/rancher/remotedialer/*/",
         "/github.com/rancher/norman/*/",
         "/github.com/rancher/wrangler/*/",
         "/github.com/rancher/apiserver/*/",
-        "/github.com/rancher/dynamiclistener/*/"
+        "/github.com/rancher/dynamiclistener/*/",
+        "/github.com/rancher/lasso/*/"
       ]
-    }
+    },
+    {
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "matchPackageNames": [
+        "/k8s.io/*/",
+        "/sigs.k8s.io/*/"
+      ]
+    },
+    {
+      "enabled": false,
+      "matchUpdateTypes": [
+        "major",
+        "minor"
+      ],
+      "matchPackageNames": [
+        "/k8s.io/*/",
+        "/sigs.k8s.io/*/"
+      ]
+    },
+    {
+      "description": "Disable major updates on release branches",
+      "matchUpdateTypes": ["major"],
+      "matchBaseBranches": ["/^release\\//"],
+      "enabled": false
+    },
+    {
+      "description": "Group all GitHub Actions updates into a single PR per branch",
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions",
+      "separateMajorMinor": false
+    },
+    {
+      "description": "Group Go dev tooling (Go version, golangci-lint) into a single PR per branch",
+      "matchPackageNames": [
+        "go",
+        "golangci/golangci-lint"
+      ],
+      "groupName": "Go dev tools",
+      "separateMajorMinor": false
+    },
+    {
+      "description": "Group golang.org/x/* packages into a single PR per branch",
+      "matchPackageNames": [
+        "/^golang\\.org\\/x\\//"
+      ],
+      "groupName": "golang.org/x packages"
+    },
   ]
 }

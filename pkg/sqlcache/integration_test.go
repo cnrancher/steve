@@ -210,13 +210,14 @@ func (i *IntegrationSuite) createNamespace(ctx context.Context, name string, thi
 	return err
 }
 
-func (i *IntegrationSuite) createSecret(ctx context.Context, name string, thisTestLabel string, projectLabel string, secretType string) error {
+func (i *IntegrationSuite) createSecret(ctx context.Context, thisTestLabel string, name string, projectLabel string, clusterName string, secretType string) error {
 	obj := &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: defaultTestNamespace,
 			Labels: map[string]string{
-				"management.cattle.io/project-scoped-secret": projectLabel,
+				"management.cattle.io/project-scoped-secret":         projectLabel,
+				"management.cattle.io/project-scoped-secret-cluster": clusterName,
 				testLabel: thisTestLabel,
 			},
 		},
@@ -500,7 +501,7 @@ func (i *IntegrationSuite) createCacheAndFactory(fields [][]string, transformFun
 		indexedFields[field.ColumnName()] = field
 	}
 
-	cache, err := cacheFactory.CacheFor(context.Background(), indexedFields, nil, nil, transformFunc, dynamicResource, configMapGVK, true, true)
+	cache, err := cacheFactory.CacheFor(context.Background(), indexedFields, nil, nil, transformFunc, dynamicResource, configMapGVK, true, true, false)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to make cache: %w", err)
 	}
@@ -1233,20 +1234,22 @@ func (i *IntegrationSuite) TestSecretProjectDependencies() {
 
 	err = ctrl.Start(ctx)
 	requireT.NoError(err)
-	secretInfo := [][3]string{
-		{"morocco", "rabat", "france"},
-		{"eritrea", "asmara", "italy"},
-		{"kenya", "nairobi", "england"},
-		{"benin", "portonovo", "france"},
+	secretInfo := [][4]string{
+		// name | project name | cluster name | secret type
+		{"morocco", "rabat", "arabic", "france"},
+		{"eritrea", "asmara", "tigrinya", "italy"},
+		{"kenya", "nairobi", "english", "england"},
+		{"benin", "portonovo", "french", "france"},
 	}
 	projectInfo := [][3]string{
+		// name | clusterName | displayName
 		{"rabat", "arabic", "casablanca"},
 		{"asmara", "tigrinya", "keren"},
 		{"nairobi", "english", "mombasa"},
 		{"portonovo", "french", "cotonou"},
 	}
 	for _, info := range secretInfo {
-		err = i.createSecret(ctx, info[0], labelTest, info[1], info[2])
+		err = i.createSecret(ctx, labelTest, info[0], info[1], info[2], info[3])
 		requireT.NoError(err)
 	}
 	dynamicClient, err := dynamic.NewForConfig(i.restCfg)
@@ -1373,6 +1376,96 @@ func (i *IntegrationSuite) TestSecretProjectDependencies() {
 			i.Assert().Equal(test.wantNames, gotNames)
 		})
 	}
+}
+
+// TestSecretProjectDependencyPropagation verifies that creating a Project after
+// the secret cache already exists propagates the project's fields into the
+// project-scoped secret rows that reference it.
+func (i *IntegrationSuite) TestSecretProjectDependencyPropagation() {
+	ctx, cancel := context.WithCancel(i.T().Context())
+	defer cancel()
+	requireT := i.Require()
+	labelTest := "SecretProjectDependencyPropagation"
+
+	cols, ccache, ctrl, sf, proxyStore, err := i.setupTest(ctx)
+	requireT.NoError(err)
+	requireT.NotNil(proxyStore)
+
+	mcioGVR := k8sschema.GroupVersionResource{
+		Group:    "management.cattle.io",
+		Version:  "v3",
+		Resource: "projects",
+	}
+
+	sqlSchemaTracker := schematracker.NewSchemaTracker(ResetFunc(func(gvk k8sschema.GroupVersionKind) error {
+		proxyStore.Reset(gvk)
+		return nil
+	}))
+	onSchemasHandler := func(schemas *schema.Collection) error {
+		var retErr error
+		retErr = errors.Join(retErr, ccache.OnSchemas(schemas))
+		retErr = errors.Join(retErr, sqlSchemaTracker.OnSchemas(schemas))
+		return retErr
+	}
+	schemacontroller.Register(ctx,
+		cols,
+		ctrl.K8s.Discovery(),
+		ctrl.CRD.CustomResourceDefinition(),
+		ctrl.API.APIService(),
+		ctrl.K8s.AuthorizationV1().SelfSubjectAccessReviews(),
+		onSchemasHandler,
+		sf)
+
+	err = ctrl.Start(ctx)
+	requireT.NoError(err)
+
+	// A single project-scoped secret "iceland" referencing project "reykjavik"
+	// in cluster "norse". No project exists yet.
+	requireT.NoError(i.createSecret(ctx, labelTest, "iceland", "reykjavik", "norse", "france"))
+
+	var secretSchema *types.APISchema
+	requireT.EventuallyWithT(func(c *assert.CollectT) {
+		secretSchema = sf.Schema("secret")
+		require.NotNil(c, secretSchema)
+	}, 15*time.Second, 500*time.Millisecond)
+	partitions := []partition.Partition{defaultPartition}
+
+	// secretsWithDisplayName returns the names of this test's project-scoped
+	// secrets whose joined-in spec.displayName equals the given value.
+	secretsWithDisplayName := func(displayName string) []string {
+		q := getFilteredQuery("filter=spec.displayName="+displayName, labelTest)
+		req, err := http.NewRequest("GET", "http://localhost:8080?"+q, nil)
+		requireT.NoError(err)
+		got, _, _, _, err := proxyStore.ListByPartitions(&types.APIRequest{Request: req}, secretSchema, partitions)
+		requireT.NoError(err)
+		return stringsFromULIst(got)
+	}
+
+	// The secret cache is built here, before the project object exists, so the
+	// row has no joined displayName yet.
+	err = waitForObjectsBySchema(ctx, proxyStore, secretSchema, labelTest, 1)
+	requireT.NoError(err)
+	requireT.Empty(secretsWithDisplayName("thingvellir"))
+
+	// Create the project, then build the projects cache so the project is
+	// upserted. That upsert must back-fill the already-cached secret row via
+	// mcioProjectExternalUpdates.
+	dynamicClient, err := dynamic.NewForConfig(i.restCfg)
+	requireT.NoError(err)
+	mcioClient := dynamicClient.Resource(mcioGVR).Namespace(defaultTestNamespace)
+	requireT.NoError(createMCIOProject(ctx, mcioClient, mcioGVR, labelTest, "reykjavik", "norse", "thingvellir", nil))
+
+	var mcioSchema *types.APISchema
+	requireT.EventuallyWithT(func(c *assert.CollectT) {
+		mcioSchema = sf.Schema("management.cattle.io.project")
+		require.NotNil(c, mcioSchema)
+	}, 15*time.Second, 500*time.Millisecond)
+	err = waitForObjectsBySchema(ctx, proxyStore, mcioSchema, labelTest, 1)
+	requireT.NoError(err)
+
+	requireT.EventuallyWithT(func(c *assert.CollectT) {
+		assert.Equal(c, []string{"iceland"}, secretsWithDisplayName("thingvellir"))
+	}, 30*time.Second, 500*time.Millisecond)
 }
 
 type summaryBlockT struct {
@@ -1508,10 +1601,10 @@ func (i *IntegrationSuite) TestSummaryFieldsOnMCIOProjects() {
 				SummaryItems: []types.SummaryEntry{
 					types.SummaryEntry{
 						Property: "spec.displayName",
-						Counts: map[string]int{
-							"high": 4,
-							"meh":  2,
-							"low":  5,
+						Counts: map[string]types.SummaryWithBreakdown{
+							"high": types.SummaryWithBreakdown{Total: 4},
+							"meh":  types.SummaryWithBreakdown{Total: 2},
+							"low":  types.SummaryWithBreakdown{Total: 5},
 						},
 					},
 				},
@@ -1524,10 +1617,10 @@ func (i *IntegrationSuite) TestSummaryFieldsOnMCIOProjects() {
 				SummaryItems: []types.SummaryEntry{
 					types.SummaryEntry{
 						Property: "spec.displayName",
-						Counts: map[string]int{
-							"high": 2,
-							"meh":  2,
-							"low":  2,
+						Counts: map[string]types.SummaryWithBreakdown{
+							"high": types.SummaryWithBreakdown{Total: 2},
+							"meh":  types.SummaryWithBreakdown{Total: 2},
+							"low":  types.SummaryWithBreakdown{Total: 2},
 						},
 					},
 				},
@@ -1540,9 +1633,9 @@ func (i *IntegrationSuite) TestSummaryFieldsOnMCIOProjects() {
 				SummaryItems: []types.SummaryEntry{
 					types.SummaryEntry{
 						Property: "spec.displayName",
-						Counts: map[string]int{
-							"high": 2,
-							"low":  4,
+						Counts: map[string]types.SummaryWithBreakdown{
+							"high": types.SummaryWithBreakdown{Total: 2},
+							"low":  types.SummaryWithBreakdown{Total: 4},
 						},
 					},
 				},
@@ -1555,9 +1648,9 @@ func (i *IntegrationSuite) TestSummaryFieldsOnMCIOProjects() {
 				SummaryItems: []types.SummaryEntry{
 					types.SummaryEntry{
 						Property: "spec.displayName",
-						Counts: map[string]int{
-							"high": 1,
-							"meh":  2,
+						Counts: map[string]types.SummaryWithBreakdown{
+							"high": types.SummaryWithBreakdown{Total: 1},
+							"meh":  types.SummaryWithBreakdown{Total: 2},
 						},
 					},
 				},
@@ -1570,9 +1663,9 @@ func (i *IntegrationSuite) TestSummaryFieldsOnMCIOProjects() {
 				SummaryItems: []types.SummaryEntry{
 					types.SummaryEntry{
 						Property: "spec.displayName",
-						Counts: map[string]int{
-							"high": 1,
-							"low":  2,
+						Counts: map[string]types.SummaryWithBreakdown{
+							"high": types.SummaryWithBreakdown{Total: 1},
+							"low":  types.SummaryWithBreakdown{Total: 2},
 						},
 					},
 				},
@@ -1585,10 +1678,10 @@ func (i *IntegrationSuite) TestSummaryFieldsOnMCIOProjects() {
 				SummaryItems: []types.SummaryEntry{
 					types.SummaryEntry{
 						Property: "metadata.labels.knot",
-						Counts: map[string]int{
-							"hitch":   3,
-							"bowline": 6,
-							"granny":  1,
+						Counts: map[string]types.SummaryWithBreakdown{
+							"hitch":   types.SummaryWithBreakdown{Total: 3},
+							"bowline": types.SummaryWithBreakdown{Total: 6},
+							"granny":  types.SummaryWithBreakdown{Total: 1},
 						},
 					},
 				},
@@ -1601,12 +1694,12 @@ func (i *IntegrationSuite) TestSummaryFieldsOnMCIOProjects() {
 				SummaryItems: []types.SummaryEntry{
 					types.SummaryEntry{
 						Property: "metadata.labels.apple",
-						Counts: map[string]int{
-							"envy":     1,
-							"ambrosia": 3,
-							"nicola":   2,
-							"salish":   2,
-							"grapple":  1,
+						Counts: map[string]types.SummaryWithBreakdown{
+							"envy":     types.SummaryWithBreakdown{Total: 1},
+							"ambrosia": types.SummaryWithBreakdown{Total: 3},
+							"nicola":   types.SummaryWithBreakdown{Total: 2},
+							"salish":   types.SummaryWithBreakdown{Total: 2},
+							"grapple":  types.SummaryWithBreakdown{Total: 1},
 						},
 					},
 				},
@@ -1619,23 +1712,23 @@ func (i *IntegrationSuite) TestSummaryFieldsOnMCIOProjects() {
 				SummaryItems: []types.SummaryEntry{
 					types.SummaryEntry{
 						Property: "metadata.labels.apple",
-						Counts: map[string]int{
-							"ambrosia": 3,
+						Counts: map[string]types.SummaryWithBreakdown{
+							"ambrosia": types.SummaryWithBreakdown{Total: 3},
 						},
 					},
 					types.SummaryEntry{
 						Property: "metadata.labels.knot",
-						Counts: map[string]int{
-							"hitch":   2,
-							"bowline": 1,
+						Counts: map[string]types.SummaryWithBreakdown{
+							"hitch":   types.SummaryWithBreakdown{Total: 2},
+							"bowline": types.SummaryWithBreakdown{Total: 1},
 						},
 					},
 					types.SummaryEntry{
 						Property: "spec.displayName",
-						Counts: map[string]int{
-							"high": 1,
-							"meh":  1,
-							"low":  1,
+						Counts: map[string]types.SummaryWithBreakdown{
+							"high": types.SummaryWithBreakdown{Total: 1},
+							"meh":  types.SummaryWithBreakdown{Total: 1},
+							"low":  types.SummaryWithBreakdown{Total: 1},
 						},
 					},
 				},

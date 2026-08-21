@@ -1026,6 +1026,61 @@ func TestParseQuery(t *testing.T) {
 		},
 	})
 	tests = append(tests, testCase{
+		description: "ParseQuery() should complain when getting summaryonly but no summary parameter",
+		req: &types.APIRequest{
+			Request: &http.Request{
+				URL: &url.URL{RawQuery: "summaryonly=true"},
+			},
+		},
+		errExpected: true,
+		errorText:   "got a summaryonly parameter but no summary fields",
+	})
+	tests = append(tests, testCase{
+		description: "ParseQuery() should complain when summaryonly is not boolean",
+		req: &types.APIRequest{
+			Request: &http.Request{
+				URL: &url.URL{RawQuery: "summary=metadata.state.name&summaryonly=marblehead"},
+			},
+		},
+		errExpected: true,
+		errorText:   `unexpected value for summaryonly parameter: "marblehead", expected true, false, or empty string`,
+	})
+	tests = append(tests, testCase{
+		description: "ParseQuery() should process a valid summaryonly parameter",
+		req: &types.APIRequest{
+			Request: &http.Request{
+				URL: &url.URL{RawQuery: "summary=metadata.state.name&summaryonly=true"},
+			},
+		},
+		expectedLO: sqltypes.ListOptions{
+			SummaryFieldList: sqltypes.SummaryFieldList{
+				[]string{"metadata", "state", "name"},
+			},
+			SummaryOnly: true,
+			Filters:     make([]sqltypes.OrFilter, 0),
+			Pagination: sqltypes.Pagination{
+				Page: 1,
+			},
+		},
+	})
+	tests = append(tests, testCase{
+		description: "ParseQuery() should ignore a summaryonly parameter=false",
+		req: &types.APIRequest{
+			Request: &http.Request{
+				URL: &url.URL{RawQuery: "summary=metadata.state.name&summaryonly=false"},
+			},
+		},
+		expectedLO: sqltypes.ListOptions{
+			SummaryFieldList: sqltypes.SummaryFieldList{
+				[]string{"metadata", "state", "name"},
+			},
+			Filters: make([]sqltypes.OrFilter, 0),
+			Pagination: sqltypes.Pagination{
+				Page: 1,
+			},
+		},
+	})
+	tests = append(tests, testCase{
 		description: "ParseQuery() should complain when more than one summary is given",
 		req: &types.APIRequest{
 			Request: &http.Request{
@@ -1147,6 +1202,79 @@ func TestParseQuery(t *testing.T) {
 		},
 		errExpected: true,
 		errorText:   "unable to parse requirement: empty summary parameter doesn't make sense",
+	})
+	tests = append(tests, testCase{
+		description: "ParseQuery() should process summary parameter with a summarynamespaced=true option",
+		req: &types.APIRequest{
+			Request: &http.Request{
+				URL: &url.URL{RawQuery: "summarynamespaced=true&summary=metadata.state.name"},
+			},
+		},
+		expectedLO: sqltypes.ListOptions{
+			SummaryFieldList: sqltypes.SummaryFieldList{
+				[]string{"metadata", "state", "name"},
+			},
+			Filters: make([]sqltypes.OrFilter, 0),
+			Pagination: sqltypes.Pagination{
+				Page: 1,
+			},
+			SummaryNamespaced: true,
+		},
+	})
+	tests = append(tests, testCase{
+		description: "ParseQuery() should process summary parameter with a summarynamespaced=false option",
+		req: &types.APIRequest{
+			Request: &http.Request{
+				URL: &url.URL{RawQuery: "summarynamespaced=false&summary=metadata.state.name"},
+			},
+		},
+		expectedLO: sqltypes.ListOptions{
+			SummaryFieldList: sqltypes.SummaryFieldList{
+				[]string{"metadata", "state", "name"},
+			},
+			Filters: make([]sqltypes.OrFilter, 0),
+			Pagination: sqltypes.Pagination{
+				Page: 1,
+			},
+		},
+	})
+	tests = append(tests, testCase{
+		description: "ParseQuery() should process summary parameter with a non-value summarynamespaced option",
+		req: &types.APIRequest{
+			Request: &http.Request{
+				URL: &url.URL{RawQuery: "summarynamespaced&summary=metadata.state.name"},
+			},
+		},
+		expectedLO: sqltypes.ListOptions{
+			SummaryFieldList: sqltypes.SummaryFieldList{
+				[]string{"metadata", "state", "name"},
+			},
+			Filters: make([]sqltypes.OrFilter, 0),
+			Pagination: sqltypes.Pagination{
+				Page: 1,
+			},
+			SummaryNamespaced: true,
+		},
+	})
+	tests = append(tests, testCase{
+		description: "ParseQuery() should complain when summarynamespaced is given but not boolean",
+		req: &types.APIRequest{
+			Request: &http.Request{
+				URL: &url.URL{RawQuery: "summary=metadata.state.name&summarynamespaced=norway"},
+			},
+		},
+		errExpected: true,
+		errorText:   `unexpected value for parameter "summarynamespaced": expected true, false, or empty string; got "norway"`,
+	})
+	tests = append(tests, testCase{
+		description: "ParseQuery() should complain when summarynamespaced is given with no summary fields",
+		req: &types.APIRequest{
+			Request: &http.Request{
+				URL: &url.URL{RawQuery: "summarynamespaced"},
+			},
+		},
+		errExpected: true,
+		errorText:   "got a summarynamespaced parameter but no summary fields",
 	})
 	t.Parallel()
 	for _, test := range tests {

@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rancher/steve/pkg/sqlcache/db/logging"
 
@@ -51,13 +52,13 @@ const (
 // Client defines a database client that provides encrypting, decrypting, and database resetting
 type Client interface {
 	WithTransaction(ctx context.Context, forWriting bool, f WithTransactionFunction) error
-	Prepare(stmt string) Stmt
+	Prepare(stmt string) (Stmt, error)
 	QueryForRows(ctx context.Context, stmt Stmt, params ...any) (Rows, error)
 	ReadObjects(rows Rows, typ reflect.Type) ([]any, error)
 	ReadStrings(rows Rows) ([]string, error)
 	ReadStringsN(rows Rows, numColumns int) ([][]string, error)
 	ReadInt(rows Rows) (int, error)
-	ReadStringIntString(rows Rows) ([][]string, error)
+	ReadStringIntString1or2(rows Rows, readThirdString bool) ([][]string, error)
 	Upsert(tx TxClient, stmt Stmt, key string, obj SerializedObject) error
 	NewConnection(isTemp bool) (string, error)
 	Serialize(obj any, encrypt bool) (SerializedObject, error)
@@ -158,6 +159,7 @@ type WithTransactionFunction func(tx TxClient) error
 
 // client is the main implementation of Client. Other implementations exist for test purposes
 type client struct {
+	Client
 	conn      Connection
 	connLock  sync.RWMutex
 	encryptor Encryptor
@@ -242,17 +244,17 @@ func NewClient(ctx context.Context, c Connection, encryptor Encryptor, decryptor
 }
 
 // Prepare prepares the given string into a sql statement on the client's connection.
-func (c *client) Prepare(queryString string) Stmt {
+func (c *client) Prepare(queryString string) (Stmt, error) {
 	c.connLock.RLock()
 	defer c.connLock.RUnlock()
 	prepared, err := c.conn.Prepare(queryString)
 	if err != nil {
-		panic(fmt.Errorf("Error preparing statement: %s\n%w", queryString, err))
+		return nil, fmt.Errorf("preparing statement: %s: %w", queryString, err)
 	}
 	return &stmt{
 		Stmt:        prepared,
 		queryString: queryString,
-	}
+	}, nil
 }
 
 // QueryForRows queries the given stmt with the given params and returns the resulting rows. The query wil be retried
@@ -282,13 +284,7 @@ func (c *client) ReadObjects(rows Rows, typ reflect.Type) ([]any, error) {
 		}
 		result = append(result, dest)
 	}
-	err := rows.Err()
-	if err != nil {
-		return nil, closeRowsOnError(rows, err)
-	}
-
-	err = rows.Close()
-	if err != nil {
+	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 
@@ -310,21 +306,16 @@ func (c *client) ReadStrings(rows Rows) ([]string, error) {
 
 		result = append(result, key)
 	}
-	err := rows.Err()
-	if err != nil {
-		return nil, closeRowsOnError(rows, err)
-	}
-
-	err = rows.Close()
-	if err != nil {
+	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 
 	return result, nil
 }
 
-// ReadStringIntString scans the given rows into (string, int, string) tuples, and then returns a slice of them.
-func (c *client) ReadStringIntString(rows Rows) ([][]string, error) {
+// ReadStringIntString1or2 scans rows into (string, int, string) tuples, and when readThirdString
+// is true, into (string, int, string, string) tuples.
+func (c *client) ReadStringIntString1or2(rows Rows, readThirdString bool) ([][]string, error) {
 	c.connLock.RLock()
 	defer c.connLock.RUnlock()
 
@@ -333,20 +324,23 @@ func (c *client) ReadStringIntString(rows Rows) ([][]string, error) {
 		var val1 string
 		var val2 int
 		var val3 string
+		if readThirdString {
+			var val4 string
+			err := rows.Scan(&val1, &val2, &val3, &val4)
+			if err != nil {
+				return nil, closeRowsOnError(rows, err)
+			}
+			result = append(result, []string{val1, strconv.Itoa(val2), val3, val4})
+			continue
+		}
+
 		err := rows.Scan(&val1, &val2, &val3)
 		if err != nil {
 			return nil, closeRowsOnError(rows, err)
 		}
-
 		result = append(result, []string{val1, strconv.Itoa(val2), val3})
 	}
-	err := rows.Err()
-	if err != nil {
-		return nil, closeRowsOnError(rows, err)
-	}
-
-	err = rows.Close()
-	if err != nil {
+	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 
@@ -373,13 +367,7 @@ func (c *client) ReadStringsN(rows Rows, numColumns int) ([][]string, error) {
 		}
 		result = append(result, stringList)
 	}
-	err := rows.Err()
-	if err != nil {
-		return nil, closeRowsOnError(rows, err)
-	}
-
-	err = rows.Close()
-	if err != nil {
+	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 
@@ -401,13 +389,7 @@ func (c *client) ReadInt(rows Rows) (int, error) {
 		return 0, closeRowsOnError(rows, err)
 	}
 
-	err = rows.Err()
-	if err != nil {
-		return 0, closeRowsOnError(rows, err)
-	}
-
-	err = rows.Close()
-	if err != nil {
+	if err := rows.Close(); err != nil {
 		return 0, err
 	}
 
@@ -549,12 +531,28 @@ func (c *client) NewConnection(useTempDir bool) (string, error) {
 	if err != nil {
 		return dbPath, err
 	}
+	sqlite.RegisterDeterministicScalarFunction("adjustTimestampForSorting", 1, adjustTimestampForSorting)
 	sqlite.RegisterDeterministicScalarFunction("extractBarredValue", 2, extractBarredValue)
 	sqlite.RegisterDeterministicScalarFunction("hasBarredValue", 2, hasBarredValue)
 	sqlite.RegisterDeterministicScalarFunction("inet_aton", 1, inetAtoN)
 	sqlite.RegisterDeterministicScalarFunction("memoryInBytes", 1, memoryInBytes)
 	c.conn = &connection{sqlDB}
 	return dbPath, nil
+}
+
+func adjustTimestampForSorting(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+	var arg1 int64
+	switch argTyped := args[0].(type) {
+	case int64:
+		arg1 = argTyped
+	default:
+		return nil, fmt.Errorf("unsupported type for arg1: expected an integer, got :%T", args[0])
+	}
+	if arg1 == 0 {
+		return arg1, nil
+	}
+	arg1 = time.Now().Unix() - arg1
+	return arg1, nil
 }
 
 func extractBarredValue(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {

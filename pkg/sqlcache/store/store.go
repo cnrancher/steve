@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/rancher/lasso/pkg/log"
 	"github.com/rancher/steve/pkg/sqlcache/db"
 	"github.com/rancher/steve/pkg/sqlcache/sqltypes"
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/cache"
 
@@ -68,6 +70,44 @@ type Store struct {
 	afterDelete    []func(key string, obj any, tx db.TxClient) error
 	afterDeleteAll []func(tx db.TxClient) error
 	beforeDropAll  []func(tx db.TxClient) error
+
+	lastSyncRV   string
+	lastSyncRVMu sync.RWMutex
+}
+
+// LastStoreSyncResourceVersion implements [cache.Store].
+func (s *Store) LastStoreSyncResourceVersion() string {
+	s.lastSyncRVMu.RLock()
+	defer s.lastSyncRVMu.RUnlock()
+	return s.lastSyncRV
+}
+
+// Bookmark implements the cache.Store interface.
+func (s *Store) Bookmark(resourceVersion string) {
+	s.setLastSyncRV(resourceVersion)
+}
+
+func (s *Store) setLastSyncRV(rv string) {
+	if rv == "" {
+		return
+	}
+	s.lastSyncRVMu.Lock()
+	defer s.lastSyncRVMu.Unlock()
+	s.lastSyncRV = rv
+}
+
+func (s *Store) setLastSyncRVFromObject(obj any) {
+	if obj == nil {
+		return
+	}
+	if _, isTombstone := obj.(cache.DeletedFinalStateUnknown); isTombstone {
+		return
+	}
+	accessor, err := meta.Accessor(obj)
+	if err != nil {
+		return
+	}
+	s.setLastSyncRV(accessor.GetResourceVersion())
 }
 
 // Test that Store implements cache.Indexer
@@ -76,7 +116,7 @@ var _ cache.Store = (*Store)(nil)
 // NewStore creates a SQLite-backed cache.Store for objects of the given example type
 func NewStore(ctx context.Context, example any, keyFunc cache.KeyFunc, c db.Client, shouldEncrypt bool, gvk schema.GroupVersionKind, name string, externalUpdateInfo *sqltypes.ExternalGVKUpdates, selfUpdateInfo *sqltypes.ExternalGVKUpdates) (*Store, error) {
 	exampleType := reflect.TypeOf(example)
-	if exampleType.Kind() != reflect.Ptr {
+	if exampleType.Kind() != reflect.Pointer {
 		exampleType = reflect.PointerTo(exampleType).Elem()
 	}
 	s := &Store{
@@ -112,13 +152,27 @@ func NewStore(ctx context.Context, example any, keyFunc cache.KeyFunc, c db.Clie
 		return nil, err
 	}
 
-	s.upsertStmt = s.Prepare(fmt.Sprintf(upsertStmtFmt, dbName))
-	s.deleteStmt = s.Prepare(fmt.Sprintf(deleteStmtFmt, dbName))
-	s.deleteAllStmt = s.Prepare(fmt.Sprintf(deleteAllStmtFmt, dbName))
-	s.dropBaseStmt = s.Prepare(fmt.Sprintf(dropBaseStmtFmt, dbName))
-	s.getStmt = s.Prepare(fmt.Sprintf(getStmtFmt, dbName))
-	s.listStmt = s.Prepare(fmt.Sprintf(listStmtFmt, dbName))
-	s.listKeysStmt = s.Prepare(fmt.Sprintf(listKeysStmtFmt, dbName))
+	if s.upsertStmt, err = s.Prepare(fmt.Sprintf(upsertStmtFmt, dbName)); err != nil {
+		return nil, err
+	}
+	if s.deleteStmt, err = s.Prepare(fmt.Sprintf(deleteStmtFmt, dbName)); err != nil {
+		return nil, err
+	}
+	if s.deleteAllStmt, err = s.Prepare(fmt.Sprintf(deleteAllStmtFmt, dbName)); err != nil {
+		return nil, err
+	}
+	if s.dropBaseStmt, err = s.Prepare(fmt.Sprintf(dropBaseStmtFmt, dbName)); err != nil {
+		return nil, err
+	}
+	if s.getStmt, err = s.Prepare(fmt.Sprintf(getStmtFmt, dbName)); err != nil {
+		return nil, err
+	}
+	if s.listStmt, err = s.Prepare(fmt.Sprintf(listStmtFmt, dbName)); err != nil {
+		return nil, err
+	}
+	if s.listKeysStmt, err = s.Prepare(fmt.Sprintf(listKeysStmtFmt, dbName)); err != nil {
+		return nil, err
+	}
 
 	return s, nil
 }
@@ -156,20 +210,18 @@ func (s *Store) checkUpdateExternalInfo(key string) {
 
 func (s *Store) updateExternalInfo(tx db.TxClient, key string, externalUpdateInfo *sqltypes.ExternalGVKUpdates) error {
 	for _, labelDep := range externalUpdateInfo.ExternalLabelDependencies {
-		rawGetStmt := fmt.Sprintf(`SELECT DISTINCT f.key, ex2."%s" FROM "%s_fields" f
-  LEFT OUTER JOIN "%s_labels" lt1 ON f.key = lt1.key
-  JOIN "%s_fields" ex2 ON lt1.value = ex2."%s"
- WHERE lt1.label = ? AND f."%s" != ex2."%s"`,
-			labelDep.TargetFinalFieldName,
-			labelDep.SourceGVK,
-			labelDep.SourceGVK,
-			labelDep.TargetGVK,
-			labelDep.TargetKeyFieldName,
-			labelDep.TargetFinalFieldName,
-			labelDep.TargetFinalFieldName,
-		)
-		getStmt := s.Prepare(rawGetStmt)
-		rows, err := s.QueryForRows(s.ctx, getStmt, labelDep.SourceLabelName)
+		rawGetStmt := labelDep.Query()
+
+		getStmt, err := s.Prepare(rawGetStmt)
+		if err != nil {
+			if !isDBError(err) {
+				logrus.Infof("Error preparing statement for table %s, key %s: %v", labelDep.TargetGVK, key, err)
+			}
+			continue
+		}
+
+		rows, err := s.QueryForRows(s.ctx, getStmt)
+		getStmt.Close()
 		if err != nil {
 			if !isDBError(err) {
 				logrus.Infof("Error getting external info for table %s, key %s: %v", labelDep.TargetGVK, key, err)
@@ -193,8 +245,13 @@ func (s *Store) updateExternalInfo(tx db.TxClient, key string, externalUpdateInf
 			}
 			rawStmt := fmt.Sprintf(`UPDATE "%s_fields" SET "%s" = ? WHERE key = ?`,
 				labelDep.SourceGVK, labelDep.TargetFinalFieldName)
-			preparedStmt := s.Prepare(rawStmt)
+			preparedStmt, err := s.Prepare(rawStmt)
+			if err != nil {
+				logrus.Infof("Error preparing %s: %s", rawStmt, err)
+				continue
+			}
 			_, err = tx.Stmt(preparedStmt).Exec(finalTargetValue, sourceKey)
+			preparedStmt.Close()
 			if err != nil {
 				logrus.Infof("Error running %s(%s, %s): %s", rawStmt, finalTargetValue, sourceKey, err)
 				continue
@@ -214,8 +271,15 @@ func (s *Store) updateExternalInfo(tx db.TxClient, key string, externalUpdateInf
 			nonLabelDep.TargetFinalFieldName)
 		// TODO: Try to fold the two blocks together
 
-		getStmt := s.Prepare(rawGetStmt)
+		getStmt, err := s.Prepare(rawGetStmt)
+		if err != nil {
+			if !isDBError(err) {
+				logrus.Infof("Error preparing statement for table %s, key %s: %v", nonLabelDep.TargetGVK, key, err)
+			}
+			continue
+		}
 		rows, err := s.QueryForRows(s.ctx, getStmt)
+		getStmt.Close()
 		if err != nil {
 			if !isDBError(err) {
 				logrus.Infof("Error getting external info for table %s, key %s: %v", nonLabelDep.TargetGVK, key, err)
@@ -239,8 +303,13 @@ func (s *Store) updateExternalInfo(tx db.TxClient, key string, externalUpdateInf
 			}
 			rawStmt := fmt.Sprintf(`UPDATE "%s_fields" SET "%s" = ? WHERE key = ?`,
 				nonLabelDep.SourceGVK, nonLabelDep.TargetFinalFieldName)
-			preparedStmt := s.Prepare(rawStmt)
+			preparedStmt, err := s.Prepare(rawStmt)
+			if err != nil {
+				logrus.Infof("Error preparing %s: %s", rawStmt, err)
+				continue
+			}
 			_, err = tx.Stmt(preparedStmt).Exec(finalTargetValue, sourceKey)
+			preparedStmt.Close()
 			if err != nil {
 				logrus.Infof("Error running %s(%s, %s): %s", rawStmt, finalTargetValue, sourceKey, err)
 				continue
@@ -252,16 +321,21 @@ func (s *Store) updateExternalInfo(tx db.TxClient, key string, externalUpdateInf
 				finalTargetValue)
 		}
 	}
-	return nil
 
+	return nil
 }
 
 // If the new value will change a non-empty current value, return [true, error:nil]
 func (s *Store) overrideCheck(finalFieldName, sourceGVK, sourceKey, finalTargetValue string) (bool, error) {
 	rawGetValueStmt := fmt.Sprintf(`SELECT f."%s" FROM  "%s_fields" f WHERE f.key = ?`,
 		finalFieldName, sourceGVK)
-	getValueStmt := s.Prepare(rawGetValueStmt)
+	getValueStmt, err := s.Prepare(rawGetValueStmt)
+	if err != nil {
+		logrus.Debugf("Error preparing query to check field: %s", err)
+		return false, err
+	}
 	rows, err := s.QueryForRows(s.ctx, getValueStmt, sourceKey)
+	getValueStmt.Close()
 	if err != nil {
 		logrus.Debugf("Checking the field, got error %s", err)
 		return false, err
@@ -340,6 +414,7 @@ func (s *Store) Add(obj any) error {
 		log.Errorf("Error in Store.Add for type %v: %v", s.name, err)
 		return err
 	}
+	s.setLastSyncRVFromObject(obj)
 	s.checkUpdateExternalInfo(key)
 	return nil
 }
@@ -365,6 +440,7 @@ func (s *Store) Update(obj any) error {
 		log.Errorf("Error in Store.Update for type %v: %v", s.name, err)
 		return err
 	}
+	s.setLastSyncRVFromObject(obj)
 	s.checkUpdateExternalInfo(key)
 	return nil
 }
@@ -380,6 +456,7 @@ func (s *Store) Delete(obj any) error {
 		log.Errorf("Error in Store.Delete for type %v: %v", s.name, err)
 		return err
 	}
+	s.setLastSyncRVFromObject(obj)
 	return nil
 }
 
@@ -425,7 +502,7 @@ func (s *Store) Get(obj any) (item any, exists bool, err error) {
 }
 
 // Replace will delete the contents of the Store, using instead the given list
-func (s *Store) Replace(objects []any, _ string) error {
+func (s *Store) Replace(objects []any, resourceVersion string) error {
 	objectMap := map[string]any{}
 
 	for _, object := range objects {
@@ -439,6 +516,10 @@ func (s *Store) Replace(objects []any, _ string) error {
 	if err != nil {
 		log.Errorf("Error in Store.Replace for type %v: %v", s.name, err)
 		return err
+	}
+	s.setLastSyncRV(resourceVersion)
+	for key := range objectMap {
+		s.checkUpdateExternalInfo(key)
 	}
 	return nil
 }
