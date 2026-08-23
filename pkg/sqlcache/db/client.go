@@ -54,7 +54,7 @@ type Client interface {
 	QueryForRows(ctx context.Context, stmt Stmt, params ...any) (Rows, error)
 	ReadObjects(rows Rows, typ reflect.Type) ([]any, error)
 	ReadStrings(rows Rows) ([]string, error)
-	ReadStrings2(rows Rows) ([][]string, error)
+	ReadStringsN(rows Rows, numColumns int) ([][]string, error)
 	ReadInt(rows Rows) (int, error)
 	Upsert(tx TxClient, stmt Stmt, key string, obj SerializedObject) error
 	NewConnection(isTemp bool) (string, error)
@@ -309,20 +309,25 @@ func (c *client) ReadStrings(rows Rows) ([]string, error) {
 	return result, nil
 }
 
-// ReadStrings2 scans the given rows into pairs of strings, and then returns the strings as a slice.
-func (c *client) ReadStrings2(rows Rows) ([][]string, error) {
+// ReadStringsN scans the given rows into string-slices of the specified number of columns
+func (c *client) ReadStringsN(rows Rows, numColumns int) ([][]string, error) {
 	c.connLock.RLock()
 	defer c.connLock.RUnlock()
 
 	var result [][]string
+	stringPointers := make([]any, numColumns)
 	for rows.Next() {
-		var key1, key2 string
-		err := rows.Scan(&key1, &key2)
+		// stringList needs be reinitialized on each iteration or all the final data in
+		// the `result` array will be the last row!
+		stringList := make([]string, numColumns)
+		for i := range stringList {
+			stringPointers[i] = &stringList[i]
+		}
+		err := rows.Scan(stringPointers...)
 		if err != nil {
 			return nil, closeRowsOnError(rows, err)
 		}
-
-		result = append(result, []string{key1, key2})
+		result = append(result, stringList)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err

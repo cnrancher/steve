@@ -22,14 +22,15 @@ import (
 )
 
 const (
-	defaultLimit            = 100000
-	filterParam             = "filter"
-	sortParam               = "sort"
-	pageSizeParam           = "pagesize"
-	pageParam               = "page"
-	revisionParam           = "revision"
-	projectsOrNamespacesVar = "projectsornamespaces"
-	projectIDFieldLabel     = "field.cattle.io/projectId"
+	defaultLimit               = 100000
+	filterParam                = "filter"
+	includeAssociatedDataParam = "includeAssociatedData"
+	sortParam                  = "sort"
+	pageSizeParam              = "pagesize"
+	pageParam                  = "page"
+	revisionParam              = "revision"
+	projectsOrNamespacesVar    = "projectsornamespaces"
+	projectIDFieldLabel        = "field.cattle.io/projectId"
 
 	orOp  = ","
 	notOp = "!"
@@ -183,6 +184,12 @@ func ParseQuery(apiOp *types.APIRequest, gvKind string) (sqltypes.ListOptions, e
 				fmt.Sprintf("value %s for revision query param is not valid", revision))
 		}
 		opts.Revision = revision
+	}
+
+	assocDataParams := q[includeAssociatedDataParam]
+	if len(assocDataParams) > 0 {
+		lastParam := assocDataParams[len(assocDataParams)-1]
+		opts.IncludeAssociatedData = strings.ToLower(lastParam) == "true"
 	}
 
 	return opts, nil
